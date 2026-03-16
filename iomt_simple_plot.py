@@ -1,14 +1,21 @@
 import sys
-import serial
 import numpy as np
-from PyQt6 import QtWidgets, QtCore, QtGui
+import asyncio
+from PyQt6 import QtWidgets, QtCore
 import pyqtgraph as pg
 from scipy.signal import butter, lfilter, find_peaks
+from bleak import BleakClient, BleakScanner
+import qasync
+from qasync import asyncSlot
+
+# --- UPDATE THESE WITH YOUR ESP32'S BLE DETAILS ---
+BLE_DEVICE_NAME = "Nano_ESP32_Heart" # The name your ESP32 advertises
+CHARACTERISTIC_UUID = "12345678-1234-5678-1234-56789abcdef1" # The UUID from your Arduino code
 
 class KalmanFilter:
     def __init__(self, q=0.001, r=0.1):
-        self.q = q  # Process noise
-        self.r = r  # Measurement noise
+        self.q = q  
+        self.r = r  
         self.p = 1.0
         self.x = 0
     def update(self, measurement):
@@ -25,20 +32,20 @@ class AdvancedHeartMonitor(QtWidgets.QMainWindow):
         self.raw_data = np.zeros(1000)
         self.filter_mode = "Bandpass"
         self.kf = KalmanFilter(q=0.01, r=0.5)
+        self.client = None
 
         self.initUI()
-        
-        try:
-            self.ser = serial.Serial('COM7', 115200, timeout=0.01)
-        except:
-            self.ser = serial.Serial('COM7', 115200, timeout=0.01)
 
+        # Timer just for updating the UI/Plotting now, NOT reading data
         self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.update_all)
-        self.timer.start(20) 
+        self.timer.timeout.connect(self.update_plot)
+        self.timer.start(40) # 25fps UI update is plenty
+
+        # Start the BLE connection process automatically
+        asyncio.ensure_future(self.connect_ble())
 
     def initUI(self):
-        self.setWindowTitle("Ubuntu PCG Analyzer - Nano ESP32")
+        self.setWindowTitle("Ubuntu PCG Analyzer - Nano ESP32 (BLE)")
         self.central_widget = QtWidgets.QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QtWidgets.QHBoxLayout(self.central_widget)
@@ -51,6 +58,11 @@ class AdvancedHeartMonitor(QtWidgets.QMainWindow):
         self.filter_combo.addItems(["Bandpass (20-100Hz)", "Kalman Filter", "Raw"])
         self.filter_combo.currentTextChanged.connect(self.set_filter)
         self.sidebar.addWidget(self.filter_combo)
+
+        # Connection Status
+        self.status_label = QtWidgets.QLabel("Status: Disconnected")
+        self.status_label.setStyleSheet("color: red; font-weight: bold;")
+        self.sidebar.addWidget(self.status_label)
 
         self.sidebar.addStretch()
 
@@ -70,6 +82,48 @@ class AdvancedHeartMonitor(QtWidgets.QMainWindow):
     def set_filter(self, text):
         self.filter_mode = text
 
+    async def connect_ble(self):
+        self.status_label.setText("Status: Scanning...")
+        self.status_label.setStyleSheet("color: orange; font-weight: bold;")
+        
+        # Find the device by name
+        device = await BleakScanner.find_device_by_name(BLE_DEVICE_NAME)
+        
+        if not device:
+            self.status_label.setText("Status: Device not found")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+            return
+
+        self.status_label.setText("Status: Connecting...")
+        
+        try:
+            self.client = BleakClient(device)
+            await self.client.connect()
+            
+            # Start receiving notifications
+            await self.client.start_notify(CHARACTERISTIC_UUID, self.ble_notification_handler)
+            
+            self.status_label.setText("Status: Connected")
+            self.status_label.setStyleSheet("color: green; font-weight: bold;")
+        except Exception as e:
+            self.status_label.setText(f"Status: Error connecting")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+            print(f"BLE Error: {e}")
+
+    def ble_notification_handler(self, sender, data):
+        """ This is called automatically every time the ESP32 sends a new BLE value """
+        try:
+            # Assuming the ESP32 sends the float as a string encoded in utf-8, similar to serial
+            value = float(data.decode('utf-8').strip())
+            
+            # If the ESP32 sends raw bytes (like a 4-byte float) instead of a string, 
+            # you would use struct.unpack('f', data)[0] instead.
+            
+            self.raw_data = np.roll(self.raw_data, -1)
+            self.raw_data[-1] = value
+        except Exception as e:
+            pass
+
     def apply_filters(self, data):
         centered = data - np.mean(data)
         if "Bandpass" in self.filter_mode:
@@ -80,15 +134,8 @@ class AdvancedHeartMonitor(QtWidgets.QMainWindow):
             return np.array([self.kf.update(x) for x in centered])
         return centered
 
-    def update_all(self):
-        try:
-            while self.ser.in_waiting > 0:
-                line = self.ser.readline().decode('utf-8').strip()
-                if line:
-                    self.raw_data = np.roll(self.raw_data, -1)
-                    self.raw_data[-1] = float(line)
-        except: pass
-
+    def update_plot(self):
+        """ This function now ONLY handles the math and the GUI, not data fetching """
         processed = self.apply_filters(self.raw_data)
         self.curve.setData(processed)
         
@@ -99,7 +146,13 @@ class AdvancedHeartMonitor(QtWidgets.QMainWindow):
             self.bpm_label.setText(f"{int(bpm)}")
 
 if __name__ == "__main__":
+    # Required setup for qasync to merge PyQt6 and asyncio
     app = QtWidgets.QApplication(sys.argv)
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
+    
     window = AdvancedHeartMonitor()
     window.show()
-    sys.exit(app.exec())
+    
+    with loop:
+        loop.run_forever()

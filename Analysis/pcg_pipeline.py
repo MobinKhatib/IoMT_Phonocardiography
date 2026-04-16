@@ -591,7 +591,6 @@ def run_pcg_pipeline(
         "exports": {
             "saved_filtered_wav": saved_filtered_wav,
         },
-        "medical_notice": "This is a signal analysis tool, NOT a medical diagnostic device.",
     }
 
     if include_signals:

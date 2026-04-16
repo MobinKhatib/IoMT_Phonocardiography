@@ -95,7 +95,6 @@ Default values are notebook-equivalent.
 - `classification`
 - `murmur`
 - `exports`
-- `medical_notice`
 - `signals` *(only when `include_signals=True`)*
 
 ### 4.1 `file_info`
@@ -155,6 +154,10 @@ Contains counts, thresholds, and indices/times:
 - `systolic_pct`, `diastolic_pct`
 - `assessment`
 - `cycle_results` (per-cycle murmur detail)
+  - always includes: `systolic_murmur`, `diastolic_murmur`, `systolic_grade`, `diastolic_grade`, `systolic_ratio`, `diastolic_ratio`
+  - conditionally includes:
+    - `sys_diamond` (when systolic segment length is sufficient)
+    - `dia_decrescendo` (when diastolic segment length is sufficient)
 
 ### 4.6 `signals` (optional)
 
@@ -341,3 +344,5 @@ python -m unittest -v test_pcg_pipeline.py
 ## 12) Medical disclaimer
 
 This pipeline is a **signal analysis** tool and **not** a medical diagnostic device.
+
+> Note: The medical disclaimer is documentation-level guidance and is **not** emitted as a `medical_notice` field in the JSON output.

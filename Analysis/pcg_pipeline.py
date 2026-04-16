@@ -17,8 +17,6 @@ from sklearn.preprocessing import StandardScaler
 
 @dataclass
 class PCGConfig:
-    """Configuration matching the notebook defaults."""
-
     lowcut: float = 25.0
     highcut: float = 200.0
     notch_freq: float = 50.0
@@ -351,7 +349,7 @@ def run_pcg_pipeline(
     include_signals: bool = False,
 ) -> Dict[str, Any]:
     """
-    Full notebook-equivalent pipeline as one function for backend/web UI use.
+    Full pipeline as one function for backend/web UI use.
 
     Returns a dictionary with extracted features, segmentation, classification,
     murmur analysis, and summary metrics.

@@ -19,7 +19,8 @@ from sklearn.preprocessing import StandardScaler
 class PCGConfig:
     lowcut: float = 25.0
     highcut: float = 200.0
-    notch_freq: float = 50.0
+    notch_freqs: Tuple[float, ...] = (50.0, 100.0, 150.0)
+    notch_q: float = 35.0
     filter_order: int = 4
     wavelet: str = "db6"
     wavelet_level: int = 4
@@ -45,10 +46,15 @@ class PCGConfig:
             self.murmur_grade_thresholds = [0.15, 0.30, 0.50, 0.70, 0.90]
 
 
-def notch_filter(data: np.ndarray, cutoff: float, fs: float, q: float = 30) -> np.ndarray:
-    """IIR notch filter to remove powerline hum (50/60 Hz)."""
-    b, a = iirnotch(cutoff / (0.5 * fs), q)
-    return filtfilt(b, a, data)
+def multi_notch_filter(data: np.ndarray, fs: float, freqs: Tuple[float, ...] = (50.0, 100.0, 150.0), q: float = 35.0) -> np.ndarray:
+    """Apply narrow notch filters at each frequency to remove powerline hum and harmonics."""
+    filtered = data.copy().astype(float)
+    nyq = 0.5 * fs
+    for f in freqs:
+        if f < nyq - 1.0:
+            b, a = iirnotch(f / nyq, q)
+            filtered = filtfilt(b, a, filtered)
+    return filtered
 
 
 def bandpass_filter(data: np.ndarray, lowcut: float, highcut: float, fs: float, order: int = 4) -> np.ndarray:
@@ -66,19 +72,12 @@ def lowpass_filter(data: np.ndarray, cutoff: float, fs: float, order: int = 2) -
     return filtfilt(b, a, data)
 
 
-def wavelet_denoise(data: np.ndarray, wavelet: str = "db6", level: int = 4) -> np.ndarray:
-    """
-    DWT soft-thresholding with Donoho-Johnstone universal threshold.
-    Noise σ estimated via MAD of finest detail coefficients.
-    """
-    max_lvl = pywt.dwt_max_level(len(data), wavelet)
-    level = min(level, max_lvl)
+def wavelet_denoise(data: np.ndarray, wavelet: str = "db6", level: int = 4, thresh_scale: float = 0.6) -> np.ndarray:
+    """DWT soft-thresholding; thresh_scale < 1 preserves more signal detail."""
     coeffs = pywt.wavedec(data, wavelet, level=level)
     sigma = np.median(np.abs(coeffs[-1])) / 0.6745
-    threshold = sigma * np.sqrt(2 * np.log(len(data)))
-    denoised = [coeffs[0]]
-    for d in coeffs[1:]:
-        denoised.append(pywt.threshold(d, threshold, mode="soft"))
+    uthresh = thresh_scale * sigma * np.sqrt(2 * np.log(len(data)))
+    denoised = [coeffs[0]] + [pywt.threshold(c, value=uthresh, mode="soft") for c in coeffs[1:]]
     return pywt.waverec(denoised, wavelet)
 
 
@@ -361,14 +360,15 @@ def run_pcg_pipeline(
         raw_data = raw_data[:, 0]
 
     data = raw_data.astype(np.float64)
+    data = data - np.mean(data)
     n_samples = len(data)
     duration = n_samples / sample_rate
     nyq = sample_rate / 2.0
     time_axis = np.linspace(0, duration, n_samples, endpoint=False)
 
-    data_notched = notch_filter(data, cfg.notch_freq, sample_rate)
+    data_notched = multi_notch_filter(data, sample_rate, cfg.notch_freqs, cfg.notch_q)
     data_bp = bandpass_filter(data_notched, cfg.lowcut, cfg.highcut, sample_rate, cfg.filter_order)
-    data_denoised = wavelet_denoise(data_bp, cfg.wavelet, cfg.wavelet_level)[:n_samples]
+    data_denoised = wavelet_denoise(data_bp, cfg.wavelet, cfg.wavelet_level, thresh_scale=0.6)[:n_samples]
     filtered = savgol_filter(data_denoised, window_length=11, polyorder=3)
 
     envelope = shannon_envelope(filtered, sample_rate, cfg.envelope_cutoff)

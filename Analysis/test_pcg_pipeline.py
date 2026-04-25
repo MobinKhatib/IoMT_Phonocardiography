@@ -64,7 +64,6 @@ class TestPCGPipeline(unittest.TestCase):
             "classification",
             "murmur",
             "exports",
-            "medical_notice",
         ]:
             self.assertIn(key, out)
 

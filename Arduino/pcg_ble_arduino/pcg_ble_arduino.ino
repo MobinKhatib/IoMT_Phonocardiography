@@ -16,7 +16,7 @@ const int OVERSAMPLE_COUNT = 8;
 #define CHARACTERISTIC_UUID "abcd1234-ab12-cd34-ef56-123456789abc"
 
 // --- Batching ---
-const int BATCH_SIZE = 20;
+const int BATCH_SIZE = 6;
 volatile uint16_t sampleBuffer[BATCH_SIZE];
 volatile int sampleIndex = 0;
 volatile bool batchReady = false;

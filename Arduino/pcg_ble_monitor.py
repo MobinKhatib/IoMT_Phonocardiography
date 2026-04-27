@@ -25,8 +25,6 @@ AUDIO_SAMPLE_RATE = 8000
 AUDIO_GAIN = 2.0
 
 # --- Re-clock timer ---
-# We fire the timer at ~50 Hz (every 20ms) and drain up to 10 samples per tick.
-# This is much more reliable than a 2ms timer which many OS schedulers can't hit.
 TIMER_INTERVAL_MS = 20
 SAMPLES_PER_TICK = SAMPLE_RATE * TIMER_INTERVAL_MS // 1000  # 10 samples
 
@@ -94,6 +92,9 @@ class BLEWorker(QThread):
                 print(f"[BLE] Error: {e}")
                 await asyncio.sleep(2)
 
+    def stop(self):
+        self.running = False
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -107,24 +108,17 @@ class MainWindow(QMainWindow):
         self.display_buffer_size = 2000
         self.plot_data = np.zeros(self.display_buffer_size)
 
-        # ==============================================
-        # RE-CLOCKING BUFFER
-        # ==============================================
-        # BLE batches arrive with jitter. We park samples in a FIFO
-        # and drain at a steady rate to eliminate batch-boundary noise.
+        # Re-clocking FIFO
         self.sample_fifo = collections.deque(maxlen=SAMPLE_RATE * 4)
         self._total_received = 0
         self._total_processed = 0
 
-        # Timer fires every 20ms, drains 10 samples per tick (= 500 Hz effective)
         self.reclock_timer = QTimer()
         self.reclock_timer.setTimerType(Qt.PreciseTimer)
         self.reclock_timer.timeout.connect(self._drain_samples)
         self.reclock_timer.start(TIMER_INTERVAL_MS)
 
-        # ==============================================
-        # BANDPASS FILTER
-        # ==============================================
+        # Bandpass filter (20–200 Hz)
         nyq = SAMPLE_RATE / 2.0
         low = 20.0 / nyq
         high = 200.0 / nyq
@@ -133,7 +127,7 @@ class MainWindow(QMainWindow):
 
         self.last_audio_val = 0.0
 
-        # --- Audio Setup ---
+        # Audio
         self.audio_queue = queue.Queue(maxsize=AUDIO_SAMPLE_RATE * 2)
         self.audio_stream = sd.OutputStream(
             samplerate=AUDIO_SAMPLE_RATE,
@@ -143,7 +137,7 @@ class MainWindow(QMainWindow):
         )
         self.audio_stream.start()
 
-        # UI Layout
+        # UI
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
@@ -168,7 +162,7 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.btn_stop)
         layout.addLayout(btn_layout)
 
-        # Start BLE Thread
+        # BLE thread
         self.ble_thread = BLEWorker()
         self.ble_thread.new_batch.connect(self._enqueue_batch)
         self.ble_thread.connection_status.connect(self.update_status)
@@ -176,20 +170,17 @@ class MainWindow(QMainWindow):
         print("[APP] Started. Waiting for BLE data...")
 
     def _enqueue_batch(self, values):
-        """Park BLE samples in the FIFO (don't process yet)."""
         for v in values:
             self.sample_fifo.append(v)
         self._total_received += len(values)
 
     def _drain_samples(self):
-        """Called every 20ms. Drain a fixed number of samples from the FIFO."""
         count = min(SAMPLES_PER_TICK, len(self.sample_fifo))
         for _ in range(count):
             value = self.sample_fifo.popleft()
             self.process_sample(value)
             self._total_processed += 1
 
-        # Periodic debug
         if self._total_processed > 0 and self._total_processed % 2500 == 0:
             fifo = len(self.sample_fifo)
             print(f"[DRAIN] processed={self._total_processed}, received={self._total_received}, fifo={fifo}")
@@ -226,7 +217,7 @@ class MainWindow(QMainWindow):
         if self.is_recording:
             self.recorded_data.append(value)
 
-        # --- Bandpass filter (20-200 Hz) ---
+        # Bandpass 20–200 Hz
         filtered, self.bp_zi = lfilter(
             self.bp_b, self.bp_a, [float(value)], zi=self.bp_zi
         )
@@ -236,7 +227,7 @@ class MainWindow(QMainWindow):
         norm_val = (bp_val / 300.0) * AUDIO_GAIN
         norm_val = np.clip(norm_val, -1.0, 1.0)
 
-        # Upsample with linear interpolation
+        # Linear-interpolation upsample to audio rate
         upsample_factor = AUDIO_SAMPLE_RATE // SAMPLE_RATE
         step = (norm_val - self.last_audio_val) / upsample_factor
         for i in range(upsample_factor):

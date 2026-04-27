@@ -13,11 +13,11 @@ from scipy.signal import butter, lfilter_zi, lfilter
 from datetime import datetime
 
 # --- Configuration ---
-UDP_PORT = 4210
+DISCOVERY_PORT = 4211
 SAMPLE_RATE = 500
 BATCH_SIZE = 20
-MAGIC = 0x5043  # must match Arduino
-PACKET_SIZE = 8 + BATCH_SIZE * 2  # header (8 bytes) + samples (40 bytes) = 48
+MAGIC = 0x5043
+PACKET_SIZE = 8 + BATCH_SIZE * 2  # 48 bytes
 
 # --- Audio Configuration ---
 AUDIO_SAMPLE_RATE = 8000
@@ -25,10 +25,10 @@ AUDIO_GAIN = 2.0
 
 # --- Re-clock timer ---
 TIMER_INTERVAL_MS = 20
-SAMPLES_PER_TICK = SAMPLE_RATE * TIMER_INTERVAL_MS // 1000  # 10 samples
+SAMPLES_PER_TICK = SAMPLE_RATE * TIMER_INTERVAL_MS // 1000
 
 
-class UDPWorker(QThread):
+class TCPWorker(QThread):
     new_batch = pyqtSignal(list)
     connection_status = pyqtSignal(str)
 
@@ -39,64 +39,151 @@ class UDPWorker(QThread):
         self.lost_packets = 0
 
     def run(self):
+        while self.running:
+            # 1. Discover ESP32 via UDP beacon
+            esp_ip, esp_port = self._discover()
+            if esp_ip is None:
+                continue  # stopped or timed out — outer loop handles retry
+
+            # 2. Connect via TCP and stream
+            self._stream(esp_ip, esp_port)
+
+    def _discover(self):
+        """Listen for the ESP32's UDP beacon. Returns (ip, port) or (None, None)."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.settimeout(1.0)
-
         try:
-            sock.bind(("", UDP_PORT))
+            sock.bind(("", DISCOVERY_PORT))
         except OSError as e:
             self.connection_status.emit(f"error: {e}")
-            print(f"[UDP] Bind failed: {e}")
+            print(f"[DISC] Bind failed: {e}")
+            sock.close()
+            self._sleep_interruptible(2.0)
+            return None, None
+
+        self.connection_status.emit("searching for ESP32...")
+        print(f"[DISC] Listening for beacon on UDP {DISCOVERY_PORT}")
+
+        try:
+            while self.running:
+                try:
+                    data, addr = sock.recvfrom(128)
+                except socket.timeout:
+                    continue
+
+                try:
+                    text = data.decode("ascii", errors="ignore")
+                except Exception:
+                    continue
+
+                if not text.startswith("PCG_Monitor:"):
+                    continue
+
+                try:
+                    port = int(text.split(":", 1)[1])
+                except ValueError:
+                    continue
+
+                print(f"[DISC] Found ESP32 at {addr[0]}:{port}")
+                return addr[0], port
+        finally:
+            sock.close()
+
+        return None, None
+
+    def _stream(self, esp_ip, esp_port):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
+
+        try:
+            self.connection_status.emit(f"connecting to {esp_ip}")
+            print(f"[TCP] Connecting to {esp_ip}:{esp_port}...")
+            sock.connect((esp_ip, esp_port))
+        except (socket.timeout, OSError) as e:
+            self.connection_status.emit(f"error: {e}")
+            print(f"[TCP] Connect failed: {e}")
+            sock.close()
+            self._sleep_interruptible(2.0)
             return
 
-        self.connection_status.emit("listening")
-        print(f"[UDP] Listening on port {UDP_PORT}")
+        sock.settimeout(2.0)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.connection_status.emit(f"connected ({esp_ip})")
+        print(f"[TCP] Connected to {esp_ip}")
 
         packet_count = 0
-        got_first = False
+        try:
+            while self.running:
+                data = self._recv_exact(sock, PACKET_SIZE)
+                if data is None:
+                    break
 
-        while self.running:
-            try:
-                data, addr = sock.recvfrom(2048)
-            except socket.timeout:
-                if got_first:
-                    self.connection_status.emit("waiting (no data)")
-                continue
-            except Exception as e:
-                print(f"[UDP] recv error: {e}")
-                continue
+                magic, seq, count = struct.unpack("<HIH", data[:8])
+                if magic != MAGIC or count != BATCH_SIZE:
+                    print(f"[TCP] Bad header: magic={magic:#x} count={count} — resyncing")
+                    if not self._resync(sock):
+                        break
+                    continue
 
-            if len(data) != PACKET_SIZE:
-                continue  # ignore stray packets
+                if self.last_seq is not None:
+                    expected = (self.last_seq + 1) & 0xFFFFFFFF
+                    if seq != expected:
+                        gap = (seq - expected) & 0xFFFFFFFF
+                        if gap < 1000:
+                            self.lost_packets += gap
+                self.last_seq = seq
 
-            magic, seq, count = struct.unpack("<HIH", data[:8])
-            if magic != MAGIC or count != BATCH_SIZE:
-                continue
+                samples = list(struct.unpack(f"<{BATCH_SIZE}H", data[8:]))
+                packet_count += 1
+                if packet_count <= 5 or packet_count % 100 == 0:
+                    print(f"[TCP] Packet #{packet_count} seq={seq} first={samples[0]}")
 
-            if not got_first:
-                got_first = True
-                self.connection_status.emit(f"connected ({addr[0]})")
-                print(f"[UDP] First packet from {addr[0]}")
-
-            # Track packet loss
-            if self.last_seq is not None:
-                expected = (self.last_seq + 1) & 0xFFFFFFFF
-                if seq != expected:
-                    gap = (seq - expected) & 0xFFFFFFFF
-                    if gap < 1000:  # ignore wrap-around / restart
-                        self.lost_packets += gap
-            self.last_seq = seq
-
-            samples = list(struct.unpack(f"<{BATCH_SIZE}H", data[8:]))
-            packet_count += 1
-            if packet_count <= 5 or packet_count % 100 == 0:
-                print(f"[UDP] Packet #{packet_count} seq={seq} first={samples[0]} lost_total={self.lost_packets}")
-
-            self.new_batch.emit(samples)
+                self.new_batch.emit(samples)
+        except Exception as e:
+            print(f"[TCP] Error during recv: {e}")
 
         sock.close()
+        self.connection_status.emit("disconnected")
+        print("[TCP] Disconnected, will rediscover...")
+        self.last_seq = None
+        self._sleep_interruptible(1.0)
+
+    def _recv_exact(self, sock, n):
+        buf = bytearray()
+        while len(buf) < n:
+            try:
+                chunk = sock.recv(n - len(buf))
+            except socket.timeout:
+                if not self.running:
+                    return None
+                continue
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _resync(self, sock):
+        magic_lo = MAGIC & 0xFF
+        magic_hi = (MAGIC >> 8) & 0xFF
+        prev = 0
+        for _ in range(PACKET_SIZE * 4):
+            byte = self._recv_exact(sock, 1)
+            if byte is None:
+                return False
+            if prev == magic_lo and byte[0] == magic_hi:
+                rest = self._recv_exact(sock, PACKET_SIZE - 2)
+                return rest is not None
+            prev = byte[0]
+        return False
+
+    def _sleep_interruptible(self, seconds):
+        slept = 0.0
+        while slept < seconds and self.running:
+            self.msleep(100)
+            slept += 0.1
 
     def stop(self):
         self.running = False
@@ -105,7 +192,7 @@ class UDPWorker(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Real-Time PCG Monitor (Wi-Fi)")
+        self.setWindowTitle("Real-Time PCG Monitor (Wi-Fi / TCP)")
         self.resize(800, 450)
 
         self.is_recording = False
@@ -168,12 +255,12 @@ class MainWindow(QMainWindow):
         btn_layout.addWidget(self.btn_stop)
         layout.addLayout(btn_layout)
 
-        # UDP thread
-        self.udp_thread = UDPWorker()
-        self.udp_thread.new_batch.connect(self._enqueue_batch)
-        self.udp_thread.connection_status.connect(self.update_status)
-        self.udp_thread.start()
-        print("[APP] Started. Waiting for UDP data...")
+        # TCP thread
+        self.tcp_thread = TCPWorker()
+        self.tcp_thread.new_batch.connect(self._enqueue_batch)
+        self.tcp_thread.connection_status.connect(self.update_status)
+        self.tcp_thread.start()
+        print("[APP] Started. Searching for ESP32...")
 
     def _enqueue_batch(self, values):
         for v in values:
@@ -189,7 +276,7 @@ class MainWindow(QMainWindow):
 
         if self._total_processed > 0 and self._total_processed % 2500 == 0:
             fifo = len(self.sample_fifo)
-            print(f"[DRAIN] processed={self._total_processed}, received={self._total_received}, fifo={fifo}, lost={self.udp_thread.lost_packets}")
+            print(f"[DRAIN] processed={self._total_processed}, received={self._total_received}, fifo={fifo}")
 
     def update_status(self, status):
         style = "font-weight: bold; padding: 4px; "
@@ -197,13 +284,13 @@ class MainWindow(QMainWindow):
             style += "color: red;"
         elif status.startswith("connected"):
             style += "color: green;"
-        elif status.startswith("listening"):
+        elif status.startswith("connecting") or status.startswith("searching"):
             style += "color: blue;"
         else:
             style += "color: orange;"
         self.status_label.setStyleSheet(style)
         fifo_len = len(self.sample_fifo)
-        self.status_label.setText(f"Wi-Fi: {status}  |  buffer: {fifo_len}  |  lost: {self.udp_thread.lost_packets}")
+        self.status_label.setText(f"TCP: {status}  |  buffer: {fifo_len}")
 
     def audio_callback(self, outdata, frames, time, status):
         chunk = np.zeros((frames, 1), dtype=np.float32)
@@ -268,8 +355,8 @@ class MainWindow(QMainWindow):
         self.reclock_timer.stop()
         self.audio_stream.stop()
         self.audio_stream.close()
-        self.udp_thread.stop()
-        self.udp_thread.wait(5000)
+        self.tcp_thread.stop()
+        self.tcp_thread.wait(5000)
         event.accept()
 
 

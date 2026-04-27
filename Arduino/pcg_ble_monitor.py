@@ -47,25 +47,29 @@ class BLEWorker(QThread):
             try:
                 self.connection_status.emit("scanning")
                 print("[BLE] Scanning for device...")
+
                 device = None
                 while device is None and self.running:
-                    devices = await BleakScanner.discover(timeout=3.0)
-                    print(f"[BLE] Found {len(devices)} devices: {[d.name for d in devices if d.name]}")
-                    for d in devices:
-                        if d.name and BLE_DEVICE_NAME in d.name:
-                            device = d
-                            break
-                    if device is None:
+                    device = await BleakScanner.find_device_by_filter(
+                        lambda d, ad: (
+                            SERVICE_UUID.lower() in [u.lower() for u in (ad.service_uuids or [])]
+                            or BLE_DEVICE_NAME in (ad.local_name or "")
+                            or BLE_DEVICE_NAME in (d.name or "")
+                        ),
+                        timeout=10.0,
+                    )
+                    if device is None and self.running:
+                        print("[BLE] Not found, retrying...")
                         await asyncio.sleep(1)
 
                 if not self.running:
                     return
 
-                print(f"[BLE] Connecting to {device.name} ({device.address})...")
+                print(f"[BLE] Connecting to {device.name or 'PCG_Monitor'} ({device.address})...")
 
-                async with BleakClient(device.address, timeout=10.0) as client:
+                async with BleakClient(device.address, timeout=15.0) as client:
                     self.connection_status.emit("connected")
-                    print(f"[BLE] Connected! Starting notifications...")
+                    print("[BLE] Connected! Starting notifications...")
 
                     self._notify_count = 0
 
@@ -83,7 +87,10 @@ class BLEWorker(QThread):
                     while self.running and client.is_connected:
                         await asyncio.sleep(0.1)
 
-                    await client.stop_notify(CHARACTERISTIC_UUID)
+                    try:
+                        await client.stop_notify(CHARACTERISTIC_UUID)
+                    except Exception:
+                        pass
 
                 self.connection_status.emit("disconnected")
                 print("[BLE] Disconnected")
@@ -92,9 +99,6 @@ class BLEWorker(QThread):
                 self.connection_status.emit(f"error: {e}")
                 print(f"[BLE] Error: {e}")
                 await asyncio.sleep(2)
-
-    def stop(self):
-        self.running = False
 
 
 class MainWindow(QMainWindow):

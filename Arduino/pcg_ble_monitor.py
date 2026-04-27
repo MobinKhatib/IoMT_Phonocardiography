@@ -48,8 +48,16 @@ class BLEWorker(QThread):
 
                 target = None
                 while target is None and self.running:
-                    devices = await BleakScanner.discover(timeout=5.0)
-                    target = next((d for d in devices if d.name == BLE_DEVICE_NAME), None)
+                    # macOS-safe: check d.name, ad.local_name, AND service UUID
+                    target = await BleakScanner.find_device_by_filter(
+                        lambda d, ad: (
+                            (d.name == BLE_DEVICE_NAME)
+                            or (ad.local_name == BLE_DEVICE_NAME)
+                            or (SERVICE_UUID.lower() in
+                                [str(u).lower() for u in (ad.service_uuids or [])])
+                        ),
+                        timeout=10.0,
+                    )
                     if target is None:
                         print(f"[BLE] '{BLE_DEVICE_NAME}' not found, retrying...")
                         await asyncio.sleep(1)
@@ -70,7 +78,8 @@ class BLEWorker(QThread):
                         values = list(struct.unpack(f"<{n_samples}H", data))
                         self._notify_count += 1
                         if self._notify_count <= 5 or self._notify_count % 100 == 0:
-                            print(f"[BLE] Notification #{self._notify_count}: {n_samples} samples, first={values[0]}")
+                            print(f"[BLE] Notification #{self._notify_count}: "
+                                f"{n_samples} samples, first={values[0]}")
                         self.new_batch.emit(values)
 
                     await client.start_notify(CHARACTERISTIC_UUID, on_notify)
@@ -91,7 +100,7 @@ class BLEWorker(QThread):
                 self.connection_status.emit(f"error: {e}")
                 print(f"[BLE] Error: {e}")
                 await asyncio.sleep(2)
-
+                
     def stop(self):
         self.running = False
 

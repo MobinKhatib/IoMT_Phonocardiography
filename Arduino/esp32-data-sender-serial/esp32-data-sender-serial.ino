@@ -1,40 +1,33 @@
-// --- Configuration ---
-const int ANALOG_PIN = A0;      // Connect to the 'Audio' output pin of SEN-14262
-const int SAMPLE_RATE = 500;   // Hz (1000 Hz gives a 500 Hz Nyquist limit)
-const int TIMER_INTERVAL_US = 1000000 / SAMPLE_RATE; 
+const int ANALOG_PIN        = A0;
+const int SAMPLE_RATE       = 500;                        // Hz
+const int TIMER_INTERVAL_US = 1000000 / SAMPLE_RATE;     // 2000 µs
+const int OVERSAMPLE_COUNT  = 8;                          // average 8 reads per sample
 
-hw_timer_t * timer = NULL;
+hw_timer_t* timer       = NULL;
 volatile bool sampleReady = false;
 volatile uint16_t adcValue = 0;
 
-// Interrupt Service Routine (ISR) - Triggers exactly every 1 millisecond
+// ISR — fires every 2 ms (500 Hz)
 void ARDUINO_ISR_ATTR onTimer() {
-  // Read the analog value from the sensor
-  adcValue = analogRead(ANALOG_PIN);
+  uint32_t sum = 0;
+  for (int i = 0; i < OVERSAMPLE_COUNT; i++) {
+    sum += analogRead(ANALOG_PIN);
+  }
+  adcValue    = (uint16_t)(sum / OVERSAMPLE_COUNT);
   sampleReady = true;
 }
 
 void setup() {
   Serial.begin(115200);
-  
-  // The ESP32 ADC is 12-bit by default (values from 0 to 4095)
-  analogReadResolution(12); 
+  analogReadResolution(12);   // 12-bit ADC (0–4095)
 
-  // --- Timer Setup (ESP32 Core 3.x syntax) ---
-  
-  // 1. Initialize timer with 1 MHz frequency (1 microsecond resolution)
-  timer = timerBegin(1000000); 
-  
-  // 2. Attach the ISR function to the timer
+  // Timer: 1 MHz base clock → 1 µs resolution
+  timer = timerBegin(1000000);
   timerAttachInterrupt(timer, &onTimer);
-  
-  // 3. Set alarm to trigger every TIMER_INTERVAL_US (1000 us), auto-reload = true
-  timerAlarm(timer, TIMER_INTERVAL_US, true, 0); 
+  timerAlarm(timer, TIMER_INTERVAL_US, true, 0);   // auto-reload
 }
 
 void loop() {
-  // Keep the main loop lean to prevent serial bottlenecking
-  // Only print when the ISR flags that a new sample has been taken
   if (sampleReady) {
     sampleReady = false;
     Serial.println(adcValue);

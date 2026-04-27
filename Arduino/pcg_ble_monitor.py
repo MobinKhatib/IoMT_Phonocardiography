@@ -48,28 +48,22 @@ class BLEWorker(QThread):
                 self.connection_status.emit("scanning")
                 print("[BLE] Scanning for device...")
 
-                device = None
-                while device is None and self.running:
-                    device = await BleakScanner.find_device_by_filter(
-                        lambda d, ad: (
-                            SERVICE_UUID.lower() in [u.lower() for u in (ad.service_uuids or [])]
-                            or BLE_DEVICE_NAME in (ad.local_name or "")
-                            or BLE_DEVICE_NAME in (d.name or "")
-                        ),
-                        timeout=10.0,
-                    )
-                    if device is None and self.running:
-                        print("[BLE] Not found, retrying...")
+                target = None
+                while target is None and self.running:
+                    devices = await BleakScanner.discover(timeout=5.0)
+                    target = next((d for d in devices if d.name == BLE_DEVICE_NAME), None)
+                    if target is None:
+                        print(f"[BLE] '{BLE_DEVICE_NAME}' not found, retrying...")
                         await asyncio.sleep(1)
 
                 if not self.running:
                     return
 
-                print(f"[BLE] Connecting to {device.name or 'PCG_Monitor'} ({device.address})...")
+                print(f"[BLE] Found device: {target.name} [{target.address}]")
 
-                async with BleakClient(device.address, timeout=15.0) as client:
+                async with BleakClient(target.address) as client:
                     self.connection_status.emit("connected")
-                    print("[BLE] Connected! Starting notifications...")
+                    print(f"[BLE] Connected: {client.is_connected}")
 
                     self._notify_count = 0
 
@@ -82,10 +76,10 @@ class BLEWorker(QThread):
                         self.new_batch.emit(values)
 
                     await client.start_notify(CHARACTERISTIC_UUID, on_notify)
-                    print("[BLE] Subscribed to notifications")
+                    print("[BLE] Receiving notifications...")
 
                     while self.running and client.is_connected:
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(1)
 
                     try:
                         await client.stop_notify(CHARACTERISTIC_UUID)

@@ -28,15 +28,38 @@ class PCGClient:
 
     async def connect(self):
         """Establish BLE connection to Arduino."""
-        pass
+        print(f"Searching for device: {self.device_name}")
+
+        scanner = BleakScanner()
+        devices = await scanner.discover()
+
+        target_device = None
+        for device in devices:
+            if device.name == self.device_name:
+                target_device = device
+                break
+
+        if target_device is None:
+            raise BLEConnectionError(f"Device '{self.device_name}' not found")
+
+        print(f"Found device: {target_device.address}")
+
+        try:
+            self.client = BleakClient(target_device.address)
+            await self.client.connect()
+            print("Connected to device")
+        except Exception as e:
+            raise BLEConnectionError(f"Failed to connect: {e}")
 
     async def disconnect(self):
         """Close BLE connection."""
-        pass
+        if self.client and self.client.is_connected:
+            await self.client.disconnect()
+            print("Disconnected from device")
 
     def is_connected(self) -> bool:
         """Return True if BLE connection is active."""
-        pass
+        return self.client is not None and self.client.is_connected
 
     async def analyze(self, sample_rate: int, oversample_count: int, batch_size: int,
                      patient_name: str, analysis_time_seconds: int) -> Generator:

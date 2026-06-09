@@ -59,7 +59,12 @@ class PCGClient:
 
     def is_connected(self) -> bool:
         """Return True if BLE connection is active."""
-        return self.client is not None and self.client.is_connected
+        if self.client is None:
+            return False
+        try:
+            return bool(self.client.is_connected)
+        except:
+            return False
 
     async def analyze(self, sample_rate: int, oversample_count: int, batch_size: int,
                      patient_name: str, analysis_time_seconds: int):
@@ -98,7 +103,7 @@ class PCGClient:
             await self.client.write_gatt_char(
                 self.CHARACTERISTIC_UUID,
                 packet,
-                response=False
+                response=True
             )
             print(f"Sent START command for {analysis_time_seconds}s analysis")
         except Exception as e:

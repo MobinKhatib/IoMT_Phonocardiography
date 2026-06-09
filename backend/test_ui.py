@@ -6,6 +6,7 @@ import asyncio
 import numpy as np
 from PyQt6 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
+from qasync import QEventLoop, asyncSlot
 from pcg_ble_client import PCGClient, BLEConnectionError
 
 class PCGTestUI(QtWidgets.QMainWindow):
@@ -139,28 +140,27 @@ class PCGTestUI(QtWidgets.QMainWindow):
 
         main_layout.addWidget(container)
 
-    def on_connect(self):
+    @asyncSlot()
+    async def on_connect(self):
         """Connect to Arduino."""
         device_name = self.device_input.text()
         self.client = PCGClient(device_name=device_name)
 
-        async def connect_async():
-            try:
-                await self.client.connect()
-                self.status_label.setText("Status: Connected")
-                self.status_label.setStyleSheet("color: green; font-weight: bold;")
-                self.connect_btn.setEnabled(False)
-                self.start_btn.setEnabled(True)
-                self.device_input.setEnabled(False)
-                print("Connected to Arduino")
-            except BLEConnectionError as e:
-                self.status_label.setText(f"Status: Failed - {e}")
-                self.status_label.setStyleSheet("color: red; font-weight: bold;")
-                print(f"Connection failed: {e}")
+        try:
+            await self.client.connect()
+            self.status_label.setText("Status: Connected")
+            self.status_label.setStyleSheet("color: green; font-weight: bold;")
+            self.connect_btn.setEnabled(False)
+            self.start_btn.setEnabled(True)
+            self.device_input.setEnabled(False)
+            print("Connected to Arduino")
+        except BLEConnectionError as e:
+            self.status_label.setText(f"Status: Failed - {e}")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+            print(f"Connection failed: {e}")
 
-        asyncio.create_task(connect_async())
-
-    def on_start_analysis(self):
+    @asyncSlot()
+    async def on_start_analysis(self):
         """Start analysis."""
         if not self.client or not self.client.is_connected():
             self.status_label.setText("Status: Not connected")
@@ -172,70 +172,67 @@ class PCGTestUI(QtWidgets.QMainWindow):
         self.curve_final.clear()
         self.full_signal = None
 
-        async def analyze_async():
-            try:
-                sample_rate = self.sample_rate_input.value()
-                oversample = self.oversample_input.value()
-                batch_size = self.batch_input.value()
-                patient_name = self.patient_input.text()
-                analysis_time = self.time_input.value()
+        try:
+            sample_rate = self.sample_rate_input.value()
+            oversample = self.oversample_input.value()
+            batch_size = self.batch_input.value()
+            patient_name = self.patient_input.text()
+            analysis_time = self.time_input.value()
 
-                expected_samples = sample_rate * analysis_time
-                samples_received = 0
-                batch_count = 0
+            expected_samples = sample_rate * analysis_time
+            samples_received = 0
+            batch_count = 0
 
-                self.status_label.setText("Status: Analyzing...")
+            self.status_label.setText("Status: Analyzing...")
 
-                async for batch in self.client.analyze(
-                    sample_rate=sample_rate,
-                    oversample_count=oversample,
-                    batch_size=batch_size,
-                    patient_name=patient_name,
-                    analysis_time_seconds=analysis_time
-                ):
-                    if not self.is_analyzing:
-                        break
+            async for batch in self.client.analyze(
+                sample_rate=sample_rate,
+                oversample_count=oversample,
+                batch_size=batch_size,
+                patient_name=patient_name,
+                analysis_time_seconds=analysis_time
+            ):
+                if not self.is_analyzing:
+                    break
 
-                    samples_received += len(batch)
-                    batch_count += 1
+                samples_received += len(batch)
+                batch_count += 1
 
-                    # Update plot (show only last 1000 samples for performance)
-                    display_samples = self.client._accumulated_data[-1000:]
-                    self.curve_live.setData(display_samples)
+                # Update plot (show only last 1000 samples for performance)
+                display_samples = self.client._accumulated_data[-1000:]
+                self.curve_live.setData(display_samples)
 
-                    # Update progress
-                    progress = min(100, int((samples_received / expected_samples) * 100))
-                    self.progress_bar.setValue(progress)
-                    self.progress_label.setText(f"Progress: {progress}%")
+                # Update progress
+                progress = min(100, int((samples_received / expected_samples) * 100))
+                self.progress_bar.setValue(progress)
+                self.progress_label.setText(f"Progress: {progress}%")
 
-                    # Update stats
-                    self.update_stats(samples_received, expected_samples)
+                # Update stats
+                self.update_stats(samples_received, expected_samples)
 
-                    QtCore.QCoreApplication.processEvents()
+                QtCore.QCoreApplication.processEvents()
 
-                # Get full signal
-                self.full_signal = self.client.get_full_signal()
-                self.curve_final.setData(self.full_signal)
-                self.curve_live.clear()
+            # Get full signal
+            self.full_signal = self.client.get_full_signal()
+            self.curve_final.setData(self.full_signal)
+            self.curve_live.clear()
 
-                self.progress_bar.setValue(100)
-                self.progress_label.setText("Progress: 100% (Complete)")
-                self.status_label.setText("Status: Analysis Complete")
-                self.status_label.setStyleSheet("color: blue; font-weight: bold;")
+            self.progress_bar.setValue(100)
+            self.progress_label.setText("Progress: 100% (Complete)")
+            self.status_label.setText("Status: Analysis Complete")
+            self.status_label.setStyleSheet("color: blue; font-weight: bold;")
 
-                self.update_stats(len(self.full_signal), expected_samples)
+            self.update_stats(len(self.full_signal), expected_samples)
 
-                print(f"Analysis complete: {len(self.full_signal)} samples collected")
+            print(f"Analysis complete: {len(self.full_signal)} samples collected")
 
-            except BLEConnectionError as e:
-                self.status_label.setText(f"Status: Connection Lost - {e}")
-                self.status_label.setStyleSheet("color: red; font-weight: bold;")
-                print(f"Analysis failed: {e}")
-            finally:
-                self.is_analyzing = False
-                self.start_btn.setEnabled(self.client and self.client.is_connected())
-
-        asyncio.create_task(analyze_async())
+        except BLEConnectionError as e:
+            self.status_label.setText(f"Status: Connection Lost - {e}")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+            print(f"Analysis failed: {e}")
+        finally:
+            self.is_analyzing = False
+            self.start_btn.setEnabled(self.client and self.client.is_connected())
 
     def update_stats(self, samples_received, expected_samples):
         """Update statistics display."""
@@ -266,9 +263,14 @@ class PCGTestUI(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    loop = QEventLoop(app)
+    asyncio.set_event_loop(loop)
+
     window = PCGTestUI()
     window.show()
-    sys.exit(app.exec())
+
+    with loop:
+        sys.exit(loop.run_forever())
 
 
 if __name__ == "__main__":

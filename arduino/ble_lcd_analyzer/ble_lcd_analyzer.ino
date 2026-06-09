@@ -18,7 +18,7 @@ const int TIMER_COUNT_UP = true;
 #define CHARACTERISTIC_UUID "abcd1234-ab12-cd34-ef56-123456789abc"
 
 // Display (Arduino Nano ESP32: SCL=A5(pin13), SDA=A4(pin12))
-U8G2_SSD1306_48X64_WINSTAR_F_SW_I2C u8g2(U8G2_R0, 13, 12, U8X8_PIN_NONE);
+U8G2_SSD1306_48X64_WINSTAR_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 
 // --- State Machine ---
 enum State {
@@ -287,9 +287,10 @@ void setup() {
   BLEService* pService = pServer->createService(SERVICE_UUID);
   pCharacteristic = pService->createCharacteristic(
     CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_WRITE
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY
   );
   pCharacteristic->addDescriptor(new BLE2902());
+  pCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE);
   pCharacteristic->setCallbacks(new CharacteristicCallbacks());
   pService->start();
 

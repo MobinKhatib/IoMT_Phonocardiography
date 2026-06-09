@@ -109,14 +109,30 @@ class PCGClient:
         except Exception as e:
             raise BLEConnectionError(f"Failed to send command: {e}")
 
+        # Wait for Arduino to process command
+        await asyncio.sleep(0.5)
+
         # Register notification handler
         try:
+            print(f"Starting notifications on {self.CHARACTERISTIC_UUID}...")
             await self.client.start_notify(
                 self.CHARACTERISTIC_UUID,
                 self._notification_handler
             )
+            print("Notifications started successfully")
         except Exception as e:
-            raise BLEConnectionError(f"Failed to start notifications: {e}")
+            print(f"Notification error: {e}")
+            # Try to discover services again and retry
+            try:
+                await asyncio.sleep(0.5)
+                print("Retrying notifications...")
+                await self.client.start_notify(
+                    self.CHARACTERISTIC_UUID,
+                    self._notification_handler
+                )
+                print("Notifications started on retry")
+            except Exception as e2:
+                raise BLEConnectionError(f"Failed to start notifications: {e2}")
 
         # Yield batches until analysis time expires
         expected_total_samples = sample_rate * analysis_time_seconds

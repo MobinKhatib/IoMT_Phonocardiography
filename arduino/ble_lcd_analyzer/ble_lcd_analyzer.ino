@@ -289,9 +289,14 @@ void setup() {
     CHARACTERISTIC_UUID,
     BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY
   );
-  pCharacteristic->addDescriptor(new BLE2902());
   pCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE);
   pCharacteristic->setCallbacks(new CharacteristicCallbacks());
+
+  // Add CCCD descriptor for notifications
+  BLE2902* pBLE2902 = new BLE2902();
+  pBLE2902->setNotifications(true);
+  pCharacteristic->addDescriptor(pBLE2902);
+
   pService->start();
 
   BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();

@@ -103,5 +103,15 @@ class PCGClient:
         return bytes(packet)
 
     async def _notification_handler(self, sender, data: bytearray):
-        """BLE notification callback: parse batch and queue it."""
-        pass
+        """
+        BLE notification callback: parse batch and queue it.
+        Expects data to be uint16_t values (2 bytes per sample).
+        """
+        # Convert bytearray to uint16 samples
+        num_samples = len(data) // 2
+        samples = np.frombuffer(data, dtype=np.uint16)[:num_samples]
+
+        self._accumulated_data.extend(samples.tolist())
+
+        # Queue for generator
+        await self._batch_queue.put(samples)

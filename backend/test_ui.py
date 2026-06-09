@@ -210,7 +210,11 @@ class PCGTestUI(QtWidgets.QMainWindow):
                 # Update stats
                 self.update_stats(samples_received, expected_samples)
 
-                QtCore.QCoreApplication.processEvents()
+                # Yield to the qasync event loop so Qt can repaint and pending
+                # BLE callbacks can run. Do NOT call processEvents() here: under
+                # qasync that re-enters the asyncio loop and crashes with
+                # "Cannot enter into task ... while another task is executed".
+                await asyncio.sleep(0)
 
             # Get full signal
             self.full_signal = self.client.get_full_signal()

@@ -36,10 +36,18 @@ BLECharacteristic* pCharacteristic = NULL;
 bool deviceConnected = false;
 
 // --- Sampling ---
-volatile uint16_t sampleBuffer[6];  // MAX BATCH_SIZE for now
-volatile int sampleIndex = 0;
-volatile bool batchReady = false;
+#define MAX_BATCH_SIZE 6
+
+// One completed batch of samples, passed from the sampling task to loop().
+struct SampleBatch {
+  uint16_t samples[MAX_BATCH_SIZE];
+  uint8_t count;
+};
+
 hw_timer_t* timer = NULL;
+TaskHandle_t samplingTaskHandle = NULL;
+QueueHandle_t batchQueue = NULL;       // sampling task -> loop(); buffers batches so none are dropped
+volatile bool resetSampling = false;   // signals the task to start a fresh run
 
 int sampleRate = 500;
 int oversampleCount = 8;
@@ -50,6 +58,7 @@ char patientName[16] = {0};
 // --- Analysis Timer ---
 unsigned long analysisStartTime = 0;
 bool isAnalyzing = false;
+bool shouldStartTimer = false;  // Flag to defer timer setup to main loop
 
 // --- Battery Helper ---
 int batteryPercent() {
@@ -104,19 +113,53 @@ void drawTopPanel() {
 }
 
 // --- Sampling Timer ISR ---
+// IMPORTANT: On ESP32 you must NOT call analogRead() (or most driver/RTOS
+// functions) from a hardware-timer ISR. analogRead() is not IRAM-safe and
+// acquires locks, which aborts -> the board reboots the instant the timer
+// fires. So the ISR only notifies the sampling task; the task does the reads.
 void ARDUINO_ISR_ATTR onTimer() {
-  if (!isAnalyzing || batchReady) return;
+  BaseType_t higherPriorityTaskWoken = pdFALSE;
+  vTaskNotifyGiveFromISR(samplingTaskHandle, &higherPriorityTaskWoken);
+  portYIELD_FROM_ISR(higherPriorityTaskWoken);
+}
 
-  uint32_t sum = 0;
-  for (int i = 0; i < oversampleCount; i++) {
-    sum += analogRead(SIGNAL_PIN);  // Read from signal input, not battery
-  }
-  sampleBuffer[sampleIndex] = sum / oversampleCount;
-  sampleIndex++;
+// --- Sampling Task ---
+// Runs in normal (non-ISR) context, so analogRead() is safe here. Wakes up
+// once per timer tick, takes an oversampled reading, and fills the batch.
+void samplingTask(void* param) {
+  static SampleBatch batch;
+  static int idx = 0;
 
-  if (sampleIndex >= batchSize) {
-    sampleIndex = 0;
-    batchReady = true;
+  for (;;) {
+    // Block until the timer ISR signals that it's time to take a sample.
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    // Start of a new analysis run: clear any partial batch and stale queue.
+    if (resetSampling) {
+      idx = 0;
+      xQueueReset(batchQueue);
+      resetSampling = false;
+    }
+
+    if (!isAnalyzing) {
+      idx = 0;
+      continue;
+    }
+
+    uint32_t sum = 0;
+    for (int i = 0; i < oversampleCount; i++) {
+      sum += analogRead(SIGNAL_PIN);  // Read from signal input, not battery
+    }
+    batch.samples[idx] = sum / oversampleCount;
+    idx++;
+
+    if (idx >= batchSize) {
+      batch.count = batchSize;
+      // Non-blocking hand-off to loop(). The queue buffers many batches so
+      // samples are never dropped while loop() is busy with display or BLE.
+      xQueueSend(batchQueue, &batch, 0);
+      idx = 0;
+    }
   }
 }
 
@@ -136,12 +179,15 @@ void parseStartCommand(uint8_t* data, size_t length) {
 
   // Bytes 1-4: SAMPLE_RATE (little-endian)
   sampleRate = (uint32_t)data[1] | ((uint32_t)data[2] << 8) | ((uint32_t)data[3] << 16) | ((uint32_t)data[4] << 24);
+  sampleRate = constrain(sampleRate, 100, 5000);  // Limit to safe range
 
   // Bytes 5-6: OVERSAMPLE_COUNT (little-endian)
   oversampleCount = (uint16_t)data[5] | ((uint16_t)data[6] << 8);
+  oversampleCount = constrain(oversampleCount, 1, 32);  // Limit to safe range
 
   // Bytes 7-8: BATCH_SIZE (little-endian)
   batchSize = (uint16_t)data[7] | ((uint16_t)data[8] << 8);
+  batchSize = constrain(batchSize, 1, MAX_BATCH_SIZE);  // Limit to batch buffer size
 
   // Bytes 9-12: ANALYSIS_TIME_SECONDS (little-endian)
   analysisTimeSeconds = (uint32_t)data[9] | ((uint32_t)data[10] << 8) | ((uint32_t)data[11] << 16) | ((uint32_t)data[12] << 24);
@@ -169,21 +215,9 @@ void parseStartCommand(uint8_t* data, size_t length) {
 void startAnalysis() {
   isAnalyzing = true;
   analysisStartTime = millis();
-  sampleIndex = 0;
-  batchReady = false;
+  resetSampling = true;
   currentState = STATE_ANALYZING;
-
-  // Set up timer with computed sample rate
-  if (timer != NULL) {
-    timerEnd(timer);
-  }
-
-  int timerIntervalUs = 1000000 / sampleRate;
-  timer = timerBegin(TIMER_ID, TIMER_PRESCALER, TIMER_COUNT_UP);
-  timerAttachInterrupt(timer, &onTimer, true);
-  timerAlarmWrite(timer, timerIntervalUs, true);
-  timerAlarmEnable(timer);
-
+  shouldStartTimer = true;  // Defer timer setup to main loop
   Serial.println("Analysis started");
 }
 
@@ -195,10 +229,10 @@ class ServerCallbacks : public BLEServerCallbacks {
     Serial.println("BLE: Client connected");
   }
   void onDisconnect(BLEServer* pServer) {
+    Serial.println("BLE: Client disconnected (onDisconnect callback triggered)");
     deviceConnected = false;
     isAnalyzing = false;
     currentState = STATE_IDLE;
-    Serial.println("BLE: Client disconnected");
     BLEDevice::startAdvertising();
   }
 };
@@ -211,6 +245,7 @@ class CharacteristicCallbacks : public BLECharacteristicCallbacks {
       Serial.print(value.length());
       Serial.println(" bytes");
       parseStartCommand((uint8_t*)value.data(), value.length());
+      Serial.println("BLE: Write processed successfully");
     }
   }
 };
@@ -276,6 +311,14 @@ void setup() {
   delay(500);
   analogReadResolution(12);
 
+  // Queue carries completed sample batches from the sampling task to loop().
+  // Sized to buffer plenty of batches so none are lost during display/BLE work.
+  batchQueue = xQueueCreate(64, sizeof(SampleBatch));
+
+  // Create the sampling task before any timer can notify it. The timer ISR
+  // notifies this task; the task performs the actual analogRead() sampling.
+  xTaskCreatePinnedToCore(samplingTask, "sampling", 4096, NULL, 5, &samplingTaskHandle, 1);
+
   u8g2.begin();
   currentState = STATE_INITIALIZING;
 
@@ -287,7 +330,7 @@ void setup() {
   BLEService* pService = pServer->createService(SERVICE_UUID);
   pCharacteristic = pService->createCharacteristic(
     CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE_NR | BLECharacteristic::PROPERTY_NOTIFY
   );
   pCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE);
   pCharacteristic->setCallbacks(new CharacteristicCallbacks());
@@ -312,6 +355,20 @@ void setup() {
 }
 
 void loop() {
+  // Set up timer if needed (deferred from BLE callback to avoid watchdog issues)
+  if (shouldStartTimer) {
+    shouldStartTimer = false;
+    if (timer != NULL) {
+      timerEnd(timer);
+    }
+    int timerIntervalUs = 1000000 / sampleRate;
+    timer = timerBegin(TIMER_ID, TIMER_PRESCALER, TIMER_COUNT_UP);
+    timerAttachInterrupt(timer, &onTimer, true);
+    timerAlarmWrite(timer, timerIntervalUs, true);
+    timerAlarmEnable(timer);
+    Serial.println("Timer started in main loop");
+  }
+
   // Check if analysis time has expired
   if (isAnalyzing && (millis() - analysisStartTime) > (analysisTimeSeconds * 1000UL)) {
     isAnalyzing = false;
@@ -323,20 +380,23 @@ void loop() {
     Serial.println("Analysis finished");
   }
 
-  // Send batch if ready
-  if (batchReady && deviceConnected && isAnalyzing) {
-    noInterrupts();
-    uint16_t localBatch[batchSize];
-    memcpy(localBatch, (const void*)sampleBuffer, batchSize * sizeof(uint16_t));
-    batchReady = false;
-    interrupts();
-
-    pCharacteristic->setValue((uint8_t*)localBatch, batchSize * sizeof(uint16_t));
-    pCharacteristic->notify();
-  } else if (batchReady) {
-    batchReady = false;
+  // Drain ALL completed batches from the sampling task and send them over BLE.
+  // Emptying the queue every loop keeps up even when a single iteration is slow
+  // (e.g. an OLED redraw), so no samples back up or get dropped.
+  SampleBatch outBatch;
+  while (xQueueReceive(batchQueue, &outBatch, 0) == pdTRUE) {
+    if (deviceConnected) {
+      pCharacteristic->setValue((uint8_t*)outBatch.samples, outBatch.count * sizeof(uint16_t));
+      pCharacteristic->notify();
+    }
   }
 
-  updateDisplay();
-  delay(30);
+  // Throttle the OLED: its slow I2C writes would otherwise bottleneck BLE.
+  static unsigned long lastDisplay = 0;
+  if (millis() - lastDisplay >= 150) {
+    lastDisplay = millis();
+    updateDisplay();
+  }
+
+  delay(2);
 }

@@ -48,6 +48,13 @@ class PCGClient:
             self.client = BleakClient(target_device.address)
             await self.client.connect()
             print("Connected to device")
+
+            # Give connection time to stabilize
+            await asyncio.sleep(1.0)
+
+            # Access services property to trigger discovery and MTU negotiation
+            services = self.client.services
+            print(f"Services discovered, MTU: {self.client.mtu_size}")
         except Exception as e:
             raise BLEConnectionError(f"Failed to connect: {e}")
 
@@ -94,25 +101,16 @@ class PCGClient:
         # Reset accumulation
         self._accumulated_data = []
         self._batch_queue = asyncio.Queue()
+        self._first_notif_seen = False
 
         # Encode and send START packet
         packet = self._encode_start_packet(sample_rate, oversample_count, batch_size,
                                            analysis_time_seconds, patient_name)
 
-        try:
-            await self.client.write_gatt_char(
-                self.CHARACTERISTIC_UUID,
-                packet,
-                response=True
-            )
-            print(f"Sent START command for {analysis_time_seconds}s analysis")
-        except Exception as e:
-            raise BLEConnectionError(f"Failed to send command: {e}")
-
-        # Wait for Arduino to process command
-        await asyncio.sleep(0.5)
-
-        # Register notification handler
+        # Subscribe to notifications BEFORE starting the analysis. The Arduino
+        # begins sampling the instant it receives START and calls notify()
+        # immediately; any notifications sent before we subscribe are silently
+        # dropped by the BLE stack, so we'd lose the first batches.
         try:
             print(f"Starting notifications on {self.CHARACTERISTIC_UUID}...")
             await self.client.start_notify(
@@ -121,11 +119,12 @@ class PCGClient:
             )
             print("Notifications started successfully")
         except Exception as e:
-            print(f"Notification error: {e}")
-            # Try to discover services again and retry
+            if not self.is_connected():
+                raise BLEConnectionError("Connection lost before analysis. Check Arduino serial output.")
+            # One retry after a short settle delay
             try:
-                await asyncio.sleep(0.5)
-                print("Retrying notifications...")
+                await asyncio.sleep(1.0)
+                print(f"Retrying notifications after error: {e}")
                 await self.client.start_notify(
                     self.CHARACTERISTIC_UUID,
                     self._notification_handler
@@ -133,6 +132,17 @@ class PCGClient:
                 print("Notifications started on retry")
             except Exception as e2:
                 raise BLEConnectionError(f"Failed to start notifications: {e2}")
+
+        # Now send START. We are already listening, so no batches are missed.
+        try:
+            await self.client.write_gatt_char(
+                self.CHARACTERISTIC_UUID,
+                packet,
+                response=False
+            )
+            print(f"Sent START command for {analysis_time_seconds}s analysis")
+        except Exception as e:
+            raise BLEConnectionError(f"Failed to send command: {e}")
 
         # Yield batches until analysis time expires
         expected_total_samples = sample_rate * analysis_time_seconds
@@ -223,16 +233,28 @@ class PCGClient:
 
         return bytes(packet)
 
-    async def _notification_handler(self, sender, data: bytearray):
+    def _notification_handler(self, sender, data: bytearray):
         """
         BLE notification callback: parse batch and queue it.
         Expects data to be uint16_t values (2 bytes per sample).
+
+        Synchronous on purpose: an async handler makes bleak schedule a new
+        asyncio Task for every packet, which piles up at high sample rates.
+        The queue is unbounded, so put_nowait never blocks.
         """
-        # Convert bytearray to uint16 samples
-        num_samples = len(data) // 2
-        samples = np.frombuffer(data, dtype=np.uint16)[:num_samples]
+        try:
+            # Convert bytearray to uint16 samples
+            num_samples = len(data) // 2
+            samples = np.frombuffer(data, dtype=np.uint16)[:num_samples]
 
-        self._accumulated_data.extend(samples.tolist())
+            if not getattr(self, "_first_notif_seen", False):
+                self._first_notif_seen = True
+                print(f"[notif] FIRST packet received: {len(data)} bytes, {num_samples} samples")
 
-        # Queue for generator
-        await self._batch_queue.put(samples)
+            self._accumulated_data.extend(samples.tolist())
+
+            # Queue for generator (runs in the event-loop thread, so this is safe)
+            self._batch_queue.put_nowait(samples)
+        except Exception as e:
+            # bleak swallows callback exceptions silently; surface it.
+            print(f"[notif] handler error: {e!r}")

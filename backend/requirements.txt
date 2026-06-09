@@ -1,0 +1,4 @@
+bleak==0.20.2
+numpy>=1.21.0
+pytest>=7.0.0
+pytest-asyncio>=0.18.0

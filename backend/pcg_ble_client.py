@@ -139,8 +139,39 @@ class PCGClient:
                 pass
 
     def get_full_signal(self) -> np.ndarray:
-        """Return all accumulated samples, validated to expected count."""
-        pass
+        """
+        Return all accumulated samples from analyze().
+        Validates sample count and trims/waits as needed.
+
+        Expected: sample_rate * analysis_time_seconds samples
+
+        Returns:
+            np.ndarray of shape (expected_samples,), dtype uint16
+
+        Raises:
+            BLEConnectionError: If validation times out
+        """
+        expected_samples = self._sample_rate * self._analysis_time_seconds
+
+        print(f"Waiting for {expected_samples} samples...")
+
+        # Wait up to 2 seconds for any lagging batches
+        timeout = time.time() + 2.0
+        while len(self._accumulated_data) < expected_samples and time.time() < timeout:
+            time.sleep(0.01)
+
+        actual_samples = len(self._accumulated_data)
+
+        if actual_samples < expected_samples:
+            print(f"Warning: Expected {expected_samples} samples, got {actual_samples}")
+
+        if actual_samples > expected_samples:
+            print(f"Trimming from {actual_samples} to {expected_samples} samples")
+
+        # Return exactly expected_samples
+        result = np.array(self._accumulated_data[:expected_samples], dtype=np.uint16)
+
+        return result
 
     def _encode_start_packet(self, sample_rate: int, oversample_count: int, batch_size: int,
                             analysis_time_seconds: int, patient_name: str) -> bytes:

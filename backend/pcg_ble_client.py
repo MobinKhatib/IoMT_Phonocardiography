@@ -62,12 +62,81 @@ class PCGClient:
         return self.client is not None and self.client.is_connected
 
     async def analyze(self, sample_rate: int, oversample_count: int, batch_size: int,
-                     patient_name: str, analysis_time_seconds: int) -> Generator:
+                     patient_name: str, analysis_time_seconds: int):
         """
-        Send analysis request and yield batches as they arrive.
-        Generator exits when Arduino finishes collection.
+        Send analysis request to Arduino and yield batches as they arrive.
+
+        Args:
+            sample_rate: Samples per second (e.g., 500)
+            oversample_count: ADC reads per sample (e.g., 8)
+            batch_size: Samples per BLE packet (e.g., 6)
+            patient_name: Patient identifier
+            analysis_time_seconds: Duration to collect (e.g., 60)
+
+        Yields:
+            np.ndarray of samples (length batch_size), dtype uint16
+
+        Raises:
+            BLEConnectionError: If connection drops
         """
-        pass
+        if not self.is_connected():
+            raise BLEConnectionError("Not connected to device")
+
+        # Store for later validation
+        self._sample_rate = sample_rate
+        self._analysis_time_seconds = analysis_time_seconds
+
+        # Reset accumulation
+        self._accumulated_data = []
+        self._batch_queue = asyncio.Queue()
+
+        # Encode and send START packet
+        packet = self._encode_start_packet(sample_rate, oversample_count, batch_size,
+                                           analysis_time_seconds, patient_name)
+
+        try:
+            await self.client.write_gatt_char(
+                self.CHARACTERISTIC_UUID,
+                packet,
+                response=False
+            )
+            print(f"Sent START command for {analysis_time_seconds}s analysis")
+        except Exception as e:
+            raise BLEConnectionError(f"Failed to send command: {e}")
+
+        # Register notification handler
+        try:
+            await self.client.start_notify(
+                self.CHARACTERISTIC_UUID,
+                self._notification_handler
+            )
+        except Exception as e:
+            raise BLEConnectionError(f"Failed to start notifications: {e}")
+
+        # Yield batches until analysis time expires
+        expected_total_samples = sample_rate * analysis_time_seconds
+        expected_num_batches = (expected_total_samples + batch_size - 1) // batch_size
+        batches_yielded = 0
+
+        try:
+            timeout_seconds = analysis_time_seconds + 5  # Grace period
+            while batches_yielded < expected_num_batches:
+                try:
+                    batch = await asyncio.wait_for(
+                        self._batch_queue.get(),
+                        timeout=timeout_seconds
+                    )
+                    yield batch
+                    batches_yielded += 1
+                except asyncio.TimeoutError:
+                    print("Warning: Timeout waiting for batches")
+                    break
+        finally:
+            # Stop notifications
+            try:
+                await self.client.stop_notify(self.CHARACTERISTIC_UUID)
+            except:
+                pass
 
     def get_full_signal(self) -> np.ndarray:
         """Return all accumulated samples, validated to expected count."""

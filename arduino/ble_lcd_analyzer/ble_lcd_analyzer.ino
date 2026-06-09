@@ -102,6 +102,22 @@ void drawTopPanel() {
   u8g2.drawHLine(0, 13, 48);
 }
 
+// --- BLE Callbacks ---
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    currentState = STATE_CONNECTED;
+    Serial.println("BLE: Client connected");
+  }
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    isAnalyzing = false;
+    currentState = STATE_IDLE;
+    Serial.println("BLE: Client disconnected");
+    BLEDevice::startAdvertising();
+  }
+};
+
 void updateDisplay() {
   u8g2.clearBuffer();
   drawTopPanel();
@@ -160,12 +176,35 @@ void updateDisplay() {
 
 void setup() {
   Serial.begin(115200);
+  delay(500);
   analogReadResolution(12);
+
   u8g2.begin();
+  currentState = STATE_INITIALIZING;
 
-  // BLE setup will follow in later tasks
+  // Initialize BLE
+  BLEDevice::init("PCG_Monitor_Raw");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
 
-  currentState = STATE_IDLE;  // Move out of INITIALIZING after setup
+  BLEService* pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_WRITE
+  );
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  BLEDevice::startAdvertising();
+
+  Serial.println("BLE: Advertising started");
+
+  // Brief initialization animation, then go idle
+  currentState = STATE_IDLE;
 }
 
 void loop() {

@@ -102,6 +102,90 @@ void drawTopPanel() {
   u8g2.drawHLine(0, 13, 48);
 }
 
+// --- Sampling Timer ISR ---
+void ARDUINO_ISR_ATTR onTimer() {
+  if (!isAnalyzing || batchReady) return;
+
+  uint32_t sum = 0;
+  for (int i = 0; i < oversampleCount; i++) {
+    sum += analogRead(ANALOG_PIN);
+  }
+  sampleBuffer[sampleIndex] = sum / oversampleCount;
+  sampleIndex++;
+
+  if (sampleIndex >= batchSize) {
+    sampleIndex = 0;
+    batchReady = true;
+  }
+}
+
+// --- BLE Command Parsing ---
+void parseStartCommand(uint8_t* data, size_t length) {
+  if (length < 29) {
+    Serial.println("BLE: Invalid packet length");
+    return;
+  }
+
+  // Byte 0: command type (should be 0x01 for START)
+  uint8_t cmdType = data[0];
+  if (cmdType != 0x01) {
+    Serial.println("BLE: Invalid command type");
+    return;
+  }
+
+  // Bytes 1-4: SAMPLE_RATE (little-endian)
+  sampleRate = (uint32_t)data[1] | ((uint32_t)data[2] << 8) | ((uint32_t)data[3] << 16) | ((uint32_t)data[4] << 24);
+
+  // Bytes 5-6: OVERSAMPLE_COUNT (little-endian)
+  oversampleCount = (uint16_t)data[5] | ((uint16_t)data[6] << 8);
+
+  // Bytes 7-8: BATCH_SIZE (little-endian)
+  batchSize = (uint16_t)data[7] | ((uint16_t)data[8] << 8);
+
+  // Bytes 9-12: ANALYSIS_TIME_SECONDS (little-endian)
+  analysisTimeSeconds = (uint32_t)data[9] | ((uint32_t)data[10] << 8) | ((uint32_t)data[11] << 16) | ((uint32_t)data[12] << 24);
+
+  // Bytes 13-28: Patient name (null-terminated)
+  memset(patientName, 0, sizeof(patientName));
+  strncpy(patientName, (const char*)&data[13], 15);
+  patientName[15] = '\0';
+
+  Serial.print("BLE: START command - SR=");
+  Serial.print(sampleRate);
+  Serial.print(" OS=");
+  Serial.print(oversampleCount);
+  Serial.print(" BS=");
+  Serial.print(batchSize);
+  Serial.print(" Time=");
+  Serial.print(analysisTimeSeconds);
+  Serial.print(" Patient=");
+  Serial.println(patientName);
+
+  // Start analysis
+  startAnalysis();
+}
+
+void startAnalysis() {
+  isAnalyzing = true;
+  analysisStartTime = millis();
+  sampleIndex = 0;
+  batchReady = false;
+  currentState = STATE_ANALYZING;
+
+  // Set up timer with computed sample rate
+  if (timer != NULL) {
+    timerEnd(timer);
+  }
+
+  int timerIntervalUs = 1000000 / sampleRate;
+  timer = timerBegin(TIMER_ID, TIMER_PRESCALER, TIMER_COUNT_UP);
+  timerAttachInterrupt(timer, &onTimer, true);
+  timerAlarmWrite(timer, timerIntervalUs, true);
+  timerAlarmEnable(timer);
+
+  Serial.println("Analysis started");
+}
+
 // --- BLE Callbacks ---
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
@@ -115,6 +199,18 @@ class ServerCallbacks : public BLEServerCallbacks {
     currentState = STATE_IDLE;
     Serial.println("BLE: Client disconnected");
     BLEDevice::startAdvertising();
+  }
+};
+
+class CharacteristicCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    std::string value = pCharacteristic->getValue();
+    if (value.length() > 0) {
+      Serial.print("BLE: Received ");
+      Serial.print(value.length());
+      Serial.println(" bytes");
+      parseStartCommand((uint8_t*)value.data(), value.length());
+    }
   }
 };
 
@@ -193,6 +289,7 @@ void setup() {
     BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_WRITE
   );
   pCharacteristic->addDescriptor(new BLE2902());
+  pCharacteristic->setCallbacks(new CharacteristicCallbacks());
   pService->start();
 
   BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
@@ -208,6 +305,31 @@ void setup() {
 }
 
 void loop() {
+  // Check if analysis time has expired
+  if (isAnalyzing && (millis() - analysisStartTime) > (analysisTimeSeconds * 1000UL)) {
+    isAnalyzing = false;
+    if (timer != NULL) {
+      timerEnd(timer);
+      timer = NULL;
+    }
+    currentState = STATE_CONNECTED;
+    Serial.println("Analysis finished");
+  }
+
+  // Send batch if ready
+  if (batchReady && deviceConnected && isAnalyzing) {
+    noInterrupts();
+    uint16_t localBatch[batchSize];
+    memcpy(localBatch, (const void*)sampleBuffer, batchSize * sizeof(uint16_t));
+    batchReady = false;
+    interrupts();
+
+    pCharacteristic->setValue((uint8_t*)localBatch, batchSize * sizeof(uint16_t));
+    pCharacteristic->notify();
+  } else if (batchReady) {
+    batchReady = false;
+  }
+
   updateDisplay();
-  delay(30);  // ~30 fps
+  delay(30);
 }

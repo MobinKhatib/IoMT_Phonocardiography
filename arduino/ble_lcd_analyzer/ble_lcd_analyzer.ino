@@ -17,8 +17,8 @@ const int TIMER_COUNT_UP = true;
 #define SERVICE_UUID        "12345678-1234-1234-1234-123456789abc"
 #define CHARACTERISTIC_UUID "abcd1234-ab12-cd34-ef56-123456789abc"
 
-// Display
-U8G2_SSD1306_48X64_WINSTAR_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+// Display (Arduino Nano ESP32: SCL=A5(pin13), SDA=A4(pin12))
+U8G2_SSD1306_48X64_WINSTAR_F_SW_I2C u8g2(U8G2_R0, 13, 12, U8X8_PIN_NONE);
 
 // --- State Machine ---
 enum State {

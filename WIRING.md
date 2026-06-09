@@ -15,31 +15,26 @@
 
 ---
 
-## Pinout Reference (ESP32-S3 Nano)
+## Pinout Reference (Arduino Nano ESP32)
 
 ```
-┌─────────────────────────────────────────┐
-│         ESP32-S3 NANO (Top View)        │
-├─────────────────────────────────────────┤
-│  D1/TX    GND    5V    3V3    A0        │
-│   TX     GND    VBUS   3V3   A0/ADC    │
-│                                         │
-│  D0/RX    GND    GND    D2    D3        │
-│   RX     GND    GND    GPIO2 GPIO3     │
-│                                         │
-│  D8       D9    D10    D11   D12        │
-│ GPIO8   GPIO9  GPIO10 GPIO11 GPIO12    │
-│                                         │
-│  D13      GND   GND    D15   D16        │
-│ GPIO13   GND    GND  GPIO15 GPIO16     │
-│                                         │
-│  D4/SCL  D5/SDA  D6    D7    D18       │
-│ GPIO4    GPIO5  GPIO6  GPIO7 GPIO18    │
-│ (SCL)    (SDA)                         │
-│                                         │
-│  D19      GND   GND    D21   3V3        │
-│ GPIO19   GND    GND  GPIO21  3V3       │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│      ARDUINO NANO ESP32 (Top View)       │
+├──────────────────────────────────────────┤
+│  D0/RX   GND   RESET  AREF   A0         │
+│  D1/TX   GND    VIN    3V3   A1         │
+│                                          │
+│  D2      D3     D4     D5    D6          │
+│  D7      D8     D9    D10   D11          │
+│                                          │
+│  D12    D13    GND    5V    RST          │
+│  A2     A3    A4/SDA  A5/SCL            │
+│         A6     A7     GND               │
+│                                          │
+│ I2C Default: SDA=A4(pin12)  SCL=A5(pin13)
+│ Signal Input: A0 (pin19)                │
+│ Battery Input: A1 (pin20)               │
+└──────────────────────────────────────────┘
 ```
 
 ---
@@ -48,11 +43,11 @@
 
 ### 1. OLED Display (SSD1306 I2C)
 
-**Display Pins:**
-- **GND** → ESP32 GND
-- **VCC** → ESP32 3V3
-- **SCL** → ESP32 D4 (GPIO4)
-- **SDA** → ESP32 D5 (GPIO5)
+**Display Pins (Arduino Nano ESP32):**
+- **GND** → Arduino Nano ESP32 GND
+- **VCC** → Arduino Nano ESP32 3V3
+- **SCL** → Arduino Nano ESP32 **A5** (pin 13)
+- **SDA** → Arduino Nano ESP32 **A4** (pin 12)
 
 ```
      ┌──────────────────────┐
@@ -232,17 +227,17 @@ Key: A0=Battery  A1=Signal  D4=SCL  D5=SDA
 
 ---
 
-## Pin Usage Summary
+## Pin Usage Summary (Arduino Nano ESP32)
 
-| GPIO | Function | Used | Notes |
-|------|----------|------|-------|
-| A0 | ADC Input | ✅ | Battery voltage divider (2:1 divider) |
-| A1 | ADC Input | ✅ | PCG sensor analog signal (10µF cap) |
-| D4 (GPIO4) | I2C SCL | ✅ | SSD1306 OLED display |
-| D5 (GPIO5) | I2C SDA | ✅ | SSD1306 OLED display |
+| Pin | Function | Used | Notes |
+|-----|----------|------|-------|
+| A0 (pin 19) | ADC Input | ✅ | Battery voltage divider (2:1) |
+| A1 (pin 20) | ADC Input | ✅ | PCG sensor analog signal (10µF cap) |
+| A4 (pin 12) | I2C SDA | ✅ | SSD1306 OLED display |
+| A5 (pin 13) | I2C SCL | ✅ | SSD1306 OLED display |
 | GND | Ground | ✅ | 2+ pins (battery, display, sensor) |
 | 3V3 | Power 3.3V | ✅ | Display + logic |
-| 5V/VBAT | Battery | ✅ | System power input |
+| VIN/5V | Battery | ✅ | System power input |
 
 ---
 

@@ -7,7 +7,8 @@
 #include <math.h>
 
 // --- Configuration ---
-const int ANALOG_PIN = A0;
+const int BATTERY_PIN = A0;      // Battery voltage monitor (through divider)
+const int SIGNAL_PIN = A1;       // PCG sensor analog input
 const int TIMER_ID = 0;
 const int TIMER_PRESCALER = 80;
 const int TIMER_COUNT_UP = true;
@@ -53,7 +54,7 @@ bool isAnalyzing = false;
 // --- Battery Helper ---
 int batteryPercent() {
   uint32_t mv = 0;
-  for (int i = 0; i < 16; i++) mv += analogReadMilliVolts(A0);
+  for (int i = 0; i < 16; i++) mv += analogReadMilliVolts(BATTERY_PIN);
   mv /= 16;
   float vbat = mv * 2.0 / 1000.0;   // x2 for divider, mV -> V
   int pct = (int)((vbat - 3.3) / (4.2 - 3.3) * 100.0);
@@ -108,7 +109,7 @@ void ARDUINO_ISR_ATTR onTimer() {
 
   uint32_t sum = 0;
   for (int i = 0; i < oversampleCount; i++) {
-    sum += analogRead(ANALOG_PIN);
+    sum += analogRead(SIGNAL_PIN);  // Read from signal input, not battery
   }
   sampleBuffer[sampleIndex] = sum / oversampleCount;
   sampleIndex++;

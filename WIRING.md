@@ -88,6 +88,7 @@ GND ──→ GND (OLED)
 **Setup: 2:1 Voltage Divider**
 - Monitor battery voltage to calculate percentage
 - Supports 3.3V to 4.2V (LiPo) range
+- **SEPARATE from signal input** (A0 dedicated to battery only)
 
 ```
         LiPo Battery (4.2V max)
@@ -95,7 +96,7 @@ GND ──→ GND (OLED)
         │ (+ terminal)
         ├──────────────────→ (to system power, ~5V input)
         │
-        ├──[2.2kΩ resistor]──┬──→ A0 (ADC, ESP32)
+        ├──[2.2kΩ resistor]──┬──→ A0 (ADC, Battery Monitor)
         │                     │
         └────────────────────┴──[2.2kΩ resistor]──→ GND
                              │
@@ -118,23 +119,28 @@ int pct = (int)((vbat - 3.3) / (4.2 - 3.3) * 100.0);
 
 ---
 
-### 3. Phonocardiography Sensor Input
+### 3. Phonocardiography Sensor Input (A1)
 
 **Analog Signal Path:**
-- **Sensor Output** → 10µF capacitor → **A0** (alternate: GPIO A1)
+- **Sensor Output** → 10µF capacitor → **A1** (separate from battery A0)
 - Optional: 2.2kΩ pull-up to 3V3 for impedance matching
 
 ```
     Phonocardiography Sensor
     (analog output, 0-3.3V)
            │
-           ├──[10µF cap]──┬──→ A0 (ADC)
+           ├──[10µF cap]──┬──→ A1 (ADC, Signal Input)
            │              │
            └──────────────┴──→ GND
                           
     (Optional pull-up for high-impedance sensors)
            ├──[2.2kΩ]──→ 3V3
 ```
+
+**Why separate pins?**
+- A0 dedicated to battery monitoring (always active)
+- A1 dedicated to signal sampling (during analysis)
+- Prevents interference between battery and signal readings
 
 **ADC Configuration (in code):**
 ```cpp
@@ -152,45 +158,47 @@ analogReadResolution(12);  // 12-bit resolution (0-4095 counts)
                     │ (2000-5000 mAh) │
                     └────────┬────────┘
                              │
-                    ┌────────┴────────┐
-                    │                 │
-              [Voltage Divider]  [Power]
-              (2.2k/2.2k)        │
-                    │            │
-                    ↓            ↓
-                  A0 (ADC)    +5V (VBAT)
-                    │            │
-            ┌───────┴─────┬──────┴────────┐
-            │             │               │
-        ┌─────────────────┐         ┌─────┴──────┐
-        │  ESP32-S3 NANO  │         │   100µF    │
-        │                 │         │   Capacitor│
-        │  D4──────────┬──┼─────────┤ (decouple) │
-        │  D5──────────┤  │         └─────┬──────┘
-        │              │  │               │
-        │  A0──────────┤  │            GND
-        │              │  │
-        │  3V3─────────┤  │
-        │  GND─────────┤  │
-        │              │  │
-        └──────┬───────┘  │
-               │          │
-        ┌──────┴──────┐   │
-        │ SSD1306     │   │
-        │ OLED        │   │
-        │ SCL ←───────┘   │
-        │ SDA ←────────┐  │
-        │ VCC ←────────┼──┴─→ 3V3
-        │ GND ←────────┴─────→ GND
-        │ (48x64 display)  │
-        └─────────────────┘
-        
-        ┌──────────────────┐
-        │  PCG Sensor      │
-        │  (Analog Out)    │
-        │  OUT ←──[10µF]───→ A0
-        │  GND ←────────────→ GND
-        └──────────────────┘
+                    ┌────────┴────────────────┐
+                    │                         │
+              [Voltage Divider]          [Power]
+              (2.2k/2.2k)                 │
+                    │                     │
+                    ↓                     ↓
+                  A0 (Battery)        +5V (VBAT)
+                    │                     │
+            ┌───────┴─────┬───────────────┴────────┐
+            │             │                        │
+        ┌─────────────────────────────────┐   ┌─────────────┐
+        │     ESP32-S3 NANO               │   │   100µF     │
+        │                                 │   │   Capacitor │
+        │  D4 ──────────┬─────────────────┼───┤ (decouple)  │
+        │  D5 ──────────┤                 │   └─────┬───────┘
+        │               │ (I2C for OLED)  │         │
+        │  A0 ←─ Battery Divider          │      GND
+        │  A1 ←─ PCG Sensor               │
+        │  3V3 ──────────┘                │
+        │  GND ──────────────────┬────────┘
+        │                        │
+        └────────────┬───────────┘
+                     │
+        ┌────────────┴────────────┐
+        │                         │
+    ┌─────────────────┐   ┌──────────────────┐
+    │  SSD1306 OLED   │   │  PCG Sensor      │
+    │  (48x64 display)│   │  (Analog Out)    │
+    │                 │   │                  │
+    │  SCL ← D4       │   │  OUT ──[10µF]──┐ │
+    │  SDA ← D5       │   │                 │ │
+    │  VCC ← 3V3      │   │  GND ───────────┼─┘
+    │  GND ─────────┐ │   │                 │
+    │              │ │   │              GND
+    └──────────────┼─┘   └────────┬────────┘
+                  │                │
+                  └────────┬───────┘
+                           │
+                  GND (common return)
+
+Key: A0=Battery  A1=Signal  D4=SCL  D5=SDA
 ```
 
 ---
@@ -228,12 +236,13 @@ analogReadResolution(12);  // 12-bit resolution (0-4095 counts)
 
 | GPIO | Function | Used | Notes |
 |------|----------|------|-------|
-| A0 | ADC Input | ✅ | Battery voltage divider + sensor |
-| D4 (GPIO4) | I2C SCL | ✅ | SSD1306 OLED |
-| D5 (GPIO5) | I2C SDA | ✅ | SSD1306 OLED |
-| GND | Ground | ✅ | 2 pins used |
+| A0 | ADC Input | ✅ | Battery voltage divider (2:1 divider) |
+| A1 | ADC Input | ✅ | PCG sensor analog signal (10µF cap) |
+| D4 (GPIO4) | I2C SCL | ✅ | SSD1306 OLED display |
+| D5 (GPIO5) | I2C SDA | ✅ | SSD1306 OLED display |
+| GND | Ground | ✅ | 2+ pins (battery, display, sensor) |
 | 3V3 | Power 3.3V | ✅ | Display + logic |
-| 5V/VBAT | Battery | ✅ | Optional alt power input |
+| 5V/VBAT | Battery | ✅ | System power input |
 
 ---
 

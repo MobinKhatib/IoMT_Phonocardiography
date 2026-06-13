@@ -4,7 +4,6 @@ import time
 import numpy as np
 from bleak import BleakClient, BleakScanner
 from typing import Generator
-from analyze_pipeline import PCGConfig, run_pcg_pipeline
 
 class BLEConnectionError(Exception):
     """Raised when BLE connection fails or drops."""

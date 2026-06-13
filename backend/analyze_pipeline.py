@@ -11,8 +11,7 @@ from scipy.io import wavfile
 from scipy.io.wavfile import write as wav_write
 from scipy.ndimage import uniform_filter1d
 from scipy.signal import butter, filtfilt, find_peaks, hilbert, iirnotch, savgol_filter
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler  # kept for optional IsolationForest path
 
 
 @dataclass
@@ -24,10 +23,29 @@ class PCGConfig:
     filter_order: int = 4
     wavelet: str = "db6"
     wavelet_level: int = 4
+    wavelet_thresh_scale: float = 0.6  # NEW: exposed (notebook WAVELET_THRESH_SCALE)
     envelope_cutoff: float = 8.0
     min_peak_dist: float = 0.25
     bpm_min: int = 40
     bpm_max: int = 200
+
+    # NEW: physiological S1/S2 pairing windows (seconds)
+    s1s2_min: float = 0.07
+    s1s2_max: float = 0.50
+    s2s1_min: float = 0.18
+    s2s1_max: float = 1.40
+
+    # NEW: per-cycle duration validation (ms) used to reject bad cycles
+    valid_s1_ms: Tuple[float, float] = (45.0, 200.0)
+    valid_s2_ms: Tuple[float, float] = (40.0, 160.0)
+    valid_systolic_ms: Tuple[float, float] = (150.0, 500.0)
+    valid_diastolic_ms: Tuple[float, float] = (150.0, 1300.0)
+    valid_cycle_ms: Tuple[float, float] = (400.0, 1500.0)
+
+    # robust MAD outlier scoring
+    robust_z_thresh: float = 3.5
+
+    murmur_detection_ratio: float = 0.35  # NEW: viz/report threshold only
 
     normal_ranges: Dict[str, Tuple[float, float]] = None
     murmur_grade_thresholds: List[float] = None
@@ -66,9 +84,12 @@ def bandpass_filter(data: np.ndarray, lowcut: float, highcut: float, fs: float, 
 
 
 def lowpass_filter(data: np.ndarray, cutoff: float, fs: float, order: int = 2) -> np.ndarray:
-    """Zero-phase Butterworth lowpass."""
+    """Zero-phase Butterworth lowpass (cutoff clamped to just below Nyquist)."""
     nyq = 0.5 * fs
-    b, a = butter(order, cutoff / nyq, btype="low")
+    effective_cutoff = min(cutoff, nyq - 1.0)
+    if effective_cutoff <= 0:
+        raise ValueError(f"Invalid lowpass cutoff: {cutoff}")
+    b, a = butter(order, effective_cutoff / nyq, btype="low")
     return filtfilt(b, a, data)
 
 
@@ -83,19 +104,22 @@ def wavelet_denoise(data: np.ndarray, wavelet: str = "db6", level: int = 4, thre
 
 def shannon_envelope(signal: np.ndarray, sr: int, cutoff: float = 8.0) -> np.ndarray:
     """
-    Shannon energy envelope: -x² · log(x²)
-    Better S1/S2 contrast than simple squaring.
+    Shannon energy envelope: -x² · log(x²), low-pass smoothed and peak-normalized to [0, 1].
     """
-    norm = signal / (np.max(np.abs(signal)) + 1e-10)
+    x = np.asarray(signal, dtype=np.float64)
+    x = x / (np.max(np.abs(x)) + 1e-10)
     eps = 1e-10
-    se = -norm**2 * np.log(norm**2 + eps)
-    env = lowpass_filter(se, cutoff, sr)
-    return np.maximum(env, 0)
+    se = -(x ** 2) * np.log((x ** 2) + eps)
+    env = lowpass_filter(se, cutoff, sr, order=2)
+    env = np.maximum(env, 0)
+    env = env / (np.max(env) + 1e-10)
+    return env
 
 
-def estimate_sound_width(envelope: np.ndarray, peak_idx: int, sr: int, max_width_s: float = 0.15) -> Tuple[int, int]:
-    """Find heart sound boundaries at 40% of peak height."""
-    half_height = envelope[peak_idx] * 0.4
+def estimate_sound_width(envelope: np.ndarray, peak_idx: int, sr: int, max_width_s: float = 0.15, relative_height: float = 0.4) -> Tuple[int, int]:
+    """Find heart sound boundaries where the envelope drops below `relative_height` of peak."""
+    peak_idx = int(peak_idx)
+    half_height = envelope[peak_idx] * relative_height
     max_w = int(sr * max_width_s)
 
     left = peak_idx
@@ -113,38 +137,141 @@ def estimate_sound_width(envelope: np.ndarray, peak_idx: int, sr: int, max_width
     return left, right
 
 
+def build_sound_bounds(envelope: np.ndarray, peaks: np.ndarray, sr: int, max_width_s: float, relative_height: float = 0.4) -> List[Tuple[int, int, int]]:
+    """Return sorted (peak, left, right) bounds for each peak with a positive width."""
+    bounds = []
+    for pk in peaks:
+        left, right = estimate_sound_width(envelope, pk, sr, max_width_s=max_width_s, relative_height=relative_height)
+        if right > left:
+            bounds.append((int(pk), int(left), int(right)))
+    return sorted(bounds, key=lambda x: x[0])
+
+
+def pair_s1_s2_peaks(
+    peaks: np.ndarray,
+    sr: int,
+    s1s2_min: float,
+    s1s2_max: float,
+    s2s1_min: float,
+    s2s1_max: float,
+) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, float]], np.ndarray]:
+    """
+    Physiological S1/S2 pairing.
+
+    Walks consecutive peaks: an adjacent pair (p1, p2) is accepted as (S1, S2)
+    when the S1->S2 gap falls in [s1s2_min, s1s2_max] and the following S2->S1
+    gap (if any) falls in [s2s1_min, s2s1_max].
+    """
+    s1_peaks: List[int] = []
+    s2_peaks: List[int] = []
+    cycle_pairs: List[Dict[str, float]] = []
+
+    i = 0
+    while i < len(peaks) - 1:
+        p1 = int(peaks[i])
+        p2 = int(peaks[i + 1])
+        dt12 = (p2 - p1) / sr
+
+        if s1s2_min <= dt12 <= s1s2_max:
+            next_gap_valid = True
+            if i + 2 < len(peaks):
+                p3 = int(peaks[i + 2])
+                dt23 = (p3 - p2) / sr
+                next_gap_valid = s2s1_min <= dt23 <= s2s1_max
+
+            if next_gap_valid:
+                s1_peaks.append(p1)
+                s2_peaks.append(p2)
+                cycle_pairs.append({
+                    "s1_peak": p1,
+                    "s2_peak": p2,
+                    "s1_time": p1 / sr,
+                    "s2_time": p2 / sr,
+                    "s1_s2_interval_s": dt12,
+                })
+                i += 2
+            else:
+                i += 1
+        else:
+            i += 1
+
+    s1_peaks_np = np.array(sorted(set(s1_peaks)), dtype=int)
+    s2_peaks_np = np.array(sorted(set(s2_peaks)), dtype=int)
+    used = set(s1_peaks_np.tolist()) | set(s2_peaks_np.tolist())
+    unassigned = np.array([int(p) for p in peaks if int(p) not in used], dtype=int)
+    return s1_peaks_np, s2_peaks_np, cycle_pairs, unassigned
+
+
 def segment_heart_sounds(
     filtered: np.ndarray,
     envelope: np.ndarray,
     s1_peaks: np.ndarray,
     s2_peaks: np.ndarray,
     sr: int,
+    cycle_pairs: Optional[List[Any]] = None,
 ) -> Tuple[np.ndarray, List[Tuple[str, int, int]]]:
-    """Create per-sample state labels: 0=S1, 1=Systole, 2=S2, 3=Diastole."""
+    """Create per-sample state labels: 0=S1, 1=Systole, 2=S2, 3=Diastole.
+
+    When `cycle_pairs` is supplied, systole/diastole are filled per pair with
+    physiological gap checks; otherwise a simpler nearest-neighbour fallback is used.
+    """
     n = len(filtered)
     states = np.full(n, 3, dtype=int)
 
-    s1_bounds = []
-    for pk in s1_peaks:
-        left, right = estimate_sound_width(envelope, int(pk), sr, 0.08)
+    s1_bounds = build_sound_bounds(envelope, s1_peaks, sr, max_width_s=0.08, relative_height=0.4)
+    s2_bounds = build_sound_bounds(envelope, s2_peaks, sr, max_width_s=0.07, relative_height=0.4)
+
+    s1_bound_map = {pk: (left, right) for pk, left, right in s1_bounds}
+    s2_bound_map = {pk: (left, right) for pk, left, right in s2_bounds}
+
+    for _, left, right in s1_bounds:
         states[left:right] = 0
-        s1_bounds.append((left, right))
-
-    s2_bounds = []
-    for pk in s2_peaks:
-        left, right = estimate_sound_width(envelope, int(pk), sr, 0.07)
+    for _, left, right in s2_bounds:
         states[left:right] = 2
-        s2_bounds.append((left, right))
 
-    for _, s1_end in s1_bounds:
-        next_s2 = [s2_l for s2_l, _ in s2_bounds if s2_l > s1_end]
-        if next_s2 and (next_s2[0] - s1_end) / sr < 0.40:
-            states[s1_end:next_s2[0]] = 1
+    if cycle_pairs is not None and len(cycle_pairs) > 0:
+        pair_list = []
+        for pair in cycle_pairs:
+            if isinstance(pair, dict):
+                s1_pk, s2_pk = int(pair["s1_peak"]), int(pair["s2_peak"])
+            else:
+                s1_pk, s2_pk = int(pair[0]), int(pair[1])
+            if s1_pk in s1_bound_map and s2_pk in s2_bound_map:
+                pair_list.append((s1_pk, s2_pk))
+        pair_list = sorted(pair_list, key=lambda x: x[0])
 
-    for _, s2_end in s2_bounds:
-        next_s1 = [s1_l for s1_l, _ in s1_bounds if s1_l > s2_end]
-        if next_s1:
-            states[s2_end:next_s1[0]] = 3
+        for i, (s1_pk, s2_pk) in enumerate(pair_list):
+            _, s1_right = s1_bound_map[s1_pk]
+            s2_left, s2_right = s2_bound_map[s2_pk]
+
+            systole_gap_s = (s2_left - s1_right) / sr
+            if 0.03 <= systole_gap_s <= 0.55:
+                states[s1_right:s2_left] = 1
+
+            if i + 1 < len(pair_list):
+                next_s1_pk, _ = pair_list[i + 1]
+                if next_s1_pk in s1_bound_map:
+                    next_s1_left, _ = s1_bound_map[next_s1_pk]
+                    diastole_gap_s = (next_s1_left - s2_right) / sr
+                    if 0.08 <= diastole_gap_s <= 1.30:
+                        states[s2_right:next_s1_left] = 3
+    else:
+        s1_simple = [(left, right) for _, left, right in s1_bounds]
+        s2_simple = [(left, right) for _, left, right in s2_bounds]
+
+        for _, s1_end in s1_simple:
+            next_s2 = [s2_l for s2_l, _ in s2_simple if s2_l > s1_end]
+            if next_s2:
+                gap_s = (next_s2[0] - s1_end) / sr
+                if 0.05 <= gap_s <= 0.50:
+                    states[s1_end:next_s2[0]] = 1
+
+        for _, s2_end in s2_simple:
+            next_s1 = [s1_l for s1_l, _ in s1_simple if s1_l > s2_end]
+            if next_s1:
+                gap_s = (next_s1[0] - s2_end) / sr
+                if 0.10 <= gap_s <= 1.30:
+                    states[s2_end:next_s1[0]] = 3
 
     state_names = ["S1", "Systole", "S2", "Diastole"]
     segments = []
@@ -160,6 +287,7 @@ def segment_heart_sounds(
 
 
 def spectral_centroid(x: np.ndarray, sr: int) -> float:
+    x = np.asarray(x, dtype=np.float64)
     if len(x) < 8:
         return 0.0
     mag = np.abs(np.fft.rfft(x))
@@ -168,12 +296,14 @@ def spectral_centroid(x: np.ndarray, sr: int) -> float:
 
 
 def zero_crossing_rate(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
     if len(x) < 2:
         return 0.0
     return float(np.sum(np.diff(np.sign(x)) != 0) / len(x))
 
 
 def excess_kurtosis(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
     if len(x) < 4:
         return 0.0
     m, s = np.mean(x), np.std(x)
@@ -182,9 +312,47 @@ def excess_kurtosis(x: np.ndarray) -> float:
     return float(np.mean(((x - m) / s) ** 4) - 3)
 
 
-def extract_cycle_features(filtered: np.ndarray, segments: List[Tuple[str, int, int]], sr: int) -> List[Dict[str, float]]:
-    """Extract features for each complete S1→Systole→S2→Diastole cycle."""
-    cycles = []
+def rms(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    if len(x) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(x ** 2)))
+
+
+def safe_mfcc_means(x: np.ndarray, sr: int, n_mfcc: int = 8) -> np.ndarray:
+    """MFCC means with graceful fallback for short signals / librosa issues."""
+    x = np.asarray(x, dtype=np.float64)
+    if len(x) < 16:
+        return np.zeros(n_mfcc, dtype=np.float64)
+    n_fft = min(64, len(x))
+    if n_fft < 16:
+        return np.zeros(n_mfcc, dtype=np.float64)
+    try:
+        mfccs = librosa.feature.mfcc(y=x, sr=sr, n_mfcc=n_mfcc, n_fft=n_fft, hop_length=max(1, n_fft // 4))
+        return np.mean(mfccs, axis=1).astype(np.float64)
+    except Exception:
+        return np.zeros(n_mfcc, dtype=np.float64)
+
+
+def is_valid_cycle_duration(s1_dur: float, s2_dur: float, systolic: float, diastolic: float, cycle_dur: float, cfg: PCGConfig) -> bool:
+    checks = [
+        (s1_dur, cfg.valid_s1_ms),
+        (s2_dur, cfg.valid_s2_ms),
+        (systolic, cfg.valid_systolic_ms),
+        (diastolic, cfg.valid_diastolic_ms),
+        (cycle_dur, cfg.valid_cycle_ms),
+    ]
+    return all(lo <= v <= hi for v, (lo, hi) in checks)
+
+
+def extract_cycle_features(filtered: np.ndarray, segments: List[Tuple[str, int, int]], sr: int, cfg: PCGConfig) -> Tuple[List[Dict[str, float]], List[Dict[str, Any]]]:
+    """Extract features for each complete S1->Systole->S2->Diastole cycle.
+
+    Returns (accepted_cycles, rejected_cycles). Cycles whose phase durations fall
+    outside the configured physiological ranges are rejected.
+    """
+    cycles: List[Dict[str, float]] = []
+    rejected: List[Dict[str, Any]] = []
     i = 0
     while i + 3 < len(segments):
         if (
@@ -205,72 +373,107 @@ def extract_cycle_features(filtered: np.ndarray, segments: List[Tuple[str, int, 
             full = filtered[s1_start:dia_end]
 
             if len(s1_sig) < 3 or len(s2_sig) < 3 or len(full) < 10:
+                rejected.append({"index": len(cycles) + len(rejected), "reason": "too_short"})
                 i += 1
                 continue
 
-            s1_rms = np.sqrt(np.mean(s1_sig**2))
-            s2_rms = np.sqrt(np.mean(s2_sig**2))
-            sys_rms = np.sqrt(np.mean(sys_sig**2)) if len(sys_sig) > 0 else 0
-            dia_rms = np.sqrt(np.mean(dia_sig**2)) if len(dia_sig) > 0 else 0
+            s1_rms = rms(s1_sig)
+            s2_rms = rms(s2_sig)
+            sys_rms = rms(sys_sig)
+            dia_rms = rms(dia_sig)
 
             s1_dur = len(s1_sig) / sr * 1000
             s2_dur = len(s2_sig) / sr * 1000
             systolic = (s2_start - s1_start) / sr * 1000
             diastolic = (dia_end - s2_start) / sr * 1000
             cycle_dur = (dia_end - s1_start) / sr * 1000
-            hr = 60000.0 / cycle_dur if cycle_dur > 0 else 0
+            hr = 60000.0 / cycle_dur if cycle_dur > 0 else 0.0
 
-            nfft = min(64, len(full))
-            if nfft >= 16:
-                try:
-                    mfccs = librosa.feature.mfcc(y=full, sr=sr, n_mfcc=8, n_fft=nfft)
-                    mfcc_means = np.mean(mfccs, axis=1)
-                except Exception:
-                    # Graceful fallback for environments with librosa/numba incompatibilities.
-                    # Keeps the rest of the pipeline and output schema intact.
-                    mfcc_means = np.zeros(8)
-            else:
-                mfcc_means = np.zeros(8)
+            if not is_valid_cycle_duration(s1_dur, s2_dur, systolic, diastolic, cycle_dur, cfg):
+                rejected.append({
+                    "index": len(cycles) + len(rejected),
+                    "reason": "duration_out_of_range",
+                    "s1_duration_ms": float(s1_dur),
+                    "s2_duration_ms": float(s2_dur),
+                    "systolic_ms": float(systolic),
+                    "diastolic_ms": float(diastolic),
+                    "cycle_duration_ms": float(cycle_dur),
+                    "heart_rate_bpm": float(hr),
+                })
+                i += 1
+                continue
+
+            mfcc_means = safe_mfcc_means(full, sr, n_mfcc=8)
 
             cycle = {
-                "s1_duration_ms": s1_dur,
-                "s2_duration_ms": s2_dur,
-                "systolic_ms": systolic,
-                "diastolic_ms": diastolic,
-                "cycle_duration_ms": cycle_dur,
-                "heart_rate_bpm": hr,
-                "sd_ratio": systolic / (diastolic + 1e-10),
-                "s1_rms": s1_rms,
-                "s2_rms": s2_rms,
-                "s1_s2_amp_ratio": s1_rms / (s2_rms + 1e-10),
-                "energy_concentration": (np.sum(s1_sig**2) + np.sum(s2_sig**2)) / (np.sum(full**2) + 1e-10),
+                "s1_duration_ms": float(s1_dur),
+                "s2_duration_ms": float(s2_dur),
+                "systolic_ms": float(systolic),
+                "diastolic_ms": float(diastolic),
+                "cycle_duration_ms": float(cycle_dur),
+                "heart_rate_bpm": float(hr),
+                "sd_ratio": float(systolic / (diastolic + 1e-10)),
+                "s1_rms": float(s1_rms),
+                "s2_rms": float(s2_rms),
+                "s1_s2_amp_ratio": float(s1_rms / (s2_rms + 1e-10)),
+                "energy_concentration": float((np.sum(s1_sig ** 2) + np.sum(s2_sig ** 2)) / (np.sum(full ** 2) + 1e-10)),
                 "s1_zcr": zero_crossing_rate(s1_sig),
                 "s2_zcr": zero_crossing_rate(s2_sig),
                 "s1_kurtosis": excess_kurtosis(s1_sig),
                 "s2_kurtosis": excess_kurtosis(s2_sig),
                 "s1_centroid": spectral_centroid(s1_sig, sr),
                 "s2_centroid": spectral_centroid(s2_sig, sr),
-                "sys_noise_ratio": sys_rms / (s1_rms + 1e-10),
-                "dia_noise_ratio": dia_rms / (s1_rms + 1e-10),
-                **{f"mfcc_{j}": v for j, v in enumerate(mfcc_means)},
-                "_s1_start": s1_start,
-                "_s1_end": s1_end,
-                "_sys_start": sys_start,
-                "_sys_end": sys_end,
-                "_s2_start": s2_start,
-                "_s2_end": s2_end,
-                "_dia_start": dia_start,
-                "_dia_end": dia_end,
+                "sys_noise_ratio": float(sys_rms / (s1_rms + 1e-10)),
+                "dia_noise_ratio": float(dia_rms / (s1_rms + 1e-10)),
+                **{f"mfcc_{j}": float(v) for j, v in enumerate(mfcc_means)},
+                "_s1_start": int(s1_start),
+                "_s1_end": int(s1_end),
+                "_sys_start": int(sys_start),
+                "_sys_end": int(sys_end),
+                "_s2_start": int(s2_start),
+                "_s2_end": int(s2_end),
+                "_dia_start": int(dia_start),
+                "_dia_end": int(dia_end),
             }
             cycles.append(cycle)
             i += 4
         else:
             i += 1
-    return cycles
+    return cycles, rejected
+
+
+def robust_outlier_scoring(cycles: List[Dict[str, float]], cfg: PCGConfig) -> List[Dict[str, Any]]:
+    """Median/MAD robust z-score outlier detection (replaces Isolation Forest)."""
+    outlier_keys = [
+        "heart_rate_bpm",
+        "s1_duration_ms",
+        "s2_duration_ms",
+        "systolic_ms",
+        "diastolic_ms",
+        "s1_s2_amp_ratio",
+    ]
+    findings: List[Dict[str, Any]] = []
+    for key in outlier_keys:
+        values = np.array([c[key] for c in cycles if key in c], dtype=float)
+        if len(values) < 5:
+            continue
+        median = np.median(values)
+        mad = np.median(np.abs(values - median)) + 1e-10
+        robust_z = 0.6745 * (values - median) / mad
+        for idx, z in enumerate(robust_z):
+            if abs(z) > cfg.robust_z_thresh:
+                findings.append({
+                    "cycle_index": int(idx),
+                    "feature": key,
+                    "value": float(values[idx]),
+                    "robust_z": float(z),
+                })
+    return findings
 
 
 def murmur_grade(ratio: float, thresholds: List[float]) -> int:
     """Convert energy ratio to Levine-style grade (0–6)."""
+    ratio = float(ratio)
     for i, th in enumerate(thresholds):
         if ratio < th:
             return i
@@ -283,10 +486,10 @@ def detect_murmur(
     sr: int,
     thresholds: List[float],
 ) -> Dict[str, Any]:
-    """Analyze one cardiac cycle for murmur presence."""
+    """Analyze one cardiac cycle for murmur-like activity."""
     sys_sig = filtered[int(cycle["_sys_start"]):int(cycle["_sys_end"])]
     dia_sig = filtered[int(cycle["_dia_start"]):int(cycle["_dia_end"])]
-    s1_rms = cycle["s1_rms"]
+    s1_rms = float(cycle["s1_rms"])
 
     result: Dict[str, Any] = {
         "systolic_murmur": False,
@@ -295,28 +498,33 @@ def detect_murmur(
         "diastolic_grade": 0,
         "systolic_ratio": 0.0,
         "diastolic_ratio": 0.0,
+        "sys_diamond": False,
+        "dia_decrescendo": False,
     }
 
+    if s1_rms < 1e-8:
+        return result
+
     if len(sys_sig) > 4:
-        r = np.sqrt(np.mean(sys_sig**2)) / (s1_rms + 1e-10)
+        r = float(np.sqrt(np.mean(sys_sig ** 2)) / (s1_rms + 1e-10))
         result["systolic_ratio"] = r
         result["systolic_grade"] = murmur_grade(r, thresholds)
-        result["systolic_murmur"] = r > thresholds[0]
+        result["systolic_murmur"] = bool(r > thresholds[0])
         if len(sys_sig) > 15:
             env = uniform_filter1d(np.abs(hilbert(sys_sig)), max(3, len(sys_sig) // 5))
             pk_pos = np.argmax(env) / len(env)
-            result["sys_diamond"] = 0.25 < pk_pos < 0.75
+            result["sys_diamond"] = bool(0.25 < pk_pos < 0.75)
 
     if len(dia_sig) > 4:
-        r = np.sqrt(np.mean(dia_sig**2)) / (s1_rms + 1e-10)
+        r = float(np.sqrt(np.mean(dia_sig ** 2)) / (s1_rms + 1e-10))
         result["diastolic_ratio"] = r
         result["diastolic_grade"] = murmur_grade(r, thresholds)
-        result["diastolic_murmur"] = r > thresholds[0]
+        result["diastolic_murmur"] = bool(r > thresholds[0])
         if len(dia_sig) > 15:
             env = uniform_filter1d(np.abs(hilbert(dia_sig)), max(3, len(dia_sig) // 5))
             q1 = np.mean(env[: len(env) // 4])
             q4 = np.mean(env[3 * len(env) // 4 :])
-            result["dia_decrescendo"] = q1 > 1.5 * q4 if q4 > 0 else False
+            result["dia_decrescendo"] = bool(q1 > 1.5 * q4) if q4 > 0 else False
 
     return result
 
@@ -356,10 +564,18 @@ def run_pcg_pipeline(
     cfg = config or PCGConfig()
 
     sample_rate, raw_data = wavfile.read(filename)
-    if len(raw_data.shape) > 1:
-        raw_data = raw_data[:, 0]
 
-    data = raw_data.astype(np.float64)
+    # Stereo/multichannel -> mono by channel average (was: first channel only)
+    if raw_data.ndim > 1:
+        raw_data = np.mean(raw_data, axis=1)
+
+    # Normalize integer PCM to [-1, 1] before processing (NEW)
+    if np.issubdtype(raw_data.dtype, np.integer):
+        max_val = np.iinfo(raw_data.dtype).max
+        data = raw_data.astype(np.float64) / max_val
+    else:
+        data = raw_data.astype(np.float64)
+
     data = data - np.mean(data)
     n_samples = len(data)
     duration = n_samples / sample_rate
@@ -368,8 +584,11 @@ def run_pcg_pipeline(
 
     data_notched = multi_notch_filter(data, sample_rate, cfg.notch_freqs, cfg.notch_q)
     data_bp = bandpass_filter(data_notched, cfg.lowcut, cfg.highcut, sample_rate, cfg.filter_order)
-    data_denoised = wavelet_denoise(data_bp, cfg.wavelet, cfg.wavelet_level, thresh_scale=0.6)[:n_samples]
-    filtered = savgol_filter(data_denoised, window_length=11, polyorder=3)
+    data_denoised = wavelet_denoise(data_bp, cfg.wavelet, cfg.wavelet_level, thresh_scale=cfg.wavelet_thresh_scale)[:n_samples]
+    if len(data_denoised) >= 11:
+        filtered = savgol_filter(data_denoised, window_length=11, polyorder=3)
+    else:
+        filtered = data_denoised.copy()
 
     envelope = shannon_envelope(filtered, sample_rate, cfg.envelope_cutoff)
 
@@ -381,27 +600,12 @@ def run_pcg_pipeline(
         prominence=threshold * 0.3,
     )
 
-    s1_peaks: List[int] = []
-    s2_peaks: List[int] = []
-    if len(peaks) >= 3:
-        pt = peaks / sample_rate
-        for i in range(len(peaks) - 2):
-            i1 = pt[i + 1] - pt[i]
-            i2 = pt[i + 2] - pt[i + 1]
-            if i1 < i2:
-                if int(peaks[i]) not in s1_peaks:
-                    s1_peaks.append(int(peaks[i]))
-                if int(peaks[i + 1]) not in s2_peaks:
-                    s2_peaks.append(int(peaks[i + 1]))
-            else:
-                if int(peaks[i]) not in s2_peaks:
-                    s2_peaks.append(int(peaks[i]))
-                if int(peaks[i + 1]) not in s1_peaks:
-                    s1_peaks.append(int(peaks[i + 1]))
+    # Physiological S1/S2 pairing (replaces the old i1<i2 heuristic)
+    s1_peaks_np, s2_peaks_np, cycle_pairs, unassigned_peaks = pair_s1_s2_peaks(
+        peaks, sample_rate, cfg.s1s2_min, cfg.s1s2_max, cfg.s2s1_min, cfg.s2s1_max
+    )
 
-    s1_peaks_np = np.array(sorted(set(s1_peaks)))
-    s2_peaks_np = np.array(sorted(set(s2_peaks)))
-
+    # Notebook runs segmentation with the simple fallback (does not pass cycle_pairs).
     states, segments = segment_heart_sounds(filtered, envelope, s1_peaks_np, s2_peaks_np, sample_rate)
 
     state_names = ["S1", "Systole", "S2", "Diastole"]
@@ -417,7 +621,7 @@ def run_pcg_pipeline(
                 "max_ms": float(np.max(durs)),
             }
 
-    cycles = extract_cycle_features(filtered, segments, sample_rate)
+    cycles, rejected_cycles = extract_cycle_features(filtered, segments, sample_rate, cfg)
 
     flagged: List[Dict[str, Any]] = []
     for ci, c in enumerate(cycles):
@@ -432,34 +636,9 @@ def run_pcg_pipeline(
         if violations:
             flagged.append({"cycle_index": ci, "violations": violations})
 
-    feat_keys: List[str] = []
-    labels: np.ndarray = np.array([])
-    scores: np.ndarray = np.array([])
-    anomaly_summary = {
-        "normal_cycles": 0,
-        "anomaly_cycles": 0,
-        "score_min": None,
-        "score_max": None,
-    }
-
-    if len(cycles) > 0:
-        feat_keys = [k for k in cycles[0] if not k.startswith("_")]
-        x = np.array([[c[k] for k in feat_keys] for c in cycles])
-        x = np.nan_to_num(x)
-
-        scaler = StandardScaler()
-        x_scaled = scaler.fit_transform(x)
-
-        iso_forest = IsolationForest(contamination=0.15, random_state=42, n_estimators=200)
-        labels = iso_forest.fit_predict(x_scaled)
-        scores = iso_forest.decision_function(x_scaled)
-
-        anomaly_summary = {
-            "normal_cycles": int(np.sum(labels == 1)),
-            "anomaly_cycles": int(np.sum(labels == -1)),
-            "score_min": float(scores.min()),
-            "score_max": float(scores.max()),
-        }
+    # Robust MAD outlier scoring (replaces Isolation Forest)
+    robust_outliers = robust_outlier_scoring(cycles, cfg) if len(cycles) > 0 else []
+    outlier_cycle_indices = sorted({o["cycle_index"] for o in robust_outliers})
 
     per_cycle_stats: Dict[str, Dict[str, float]] = {}
     stat_keys = [
@@ -539,9 +718,13 @@ def run_pcg_pipeline(
             "total_peaks": int(len(peaks)),
             "s1_count": int(len(s1_peaks_np)),
             "s2_count": int(len(s2_peaks_np)),
+            "unassigned_count": int(len(unassigned_peaks)),
+            "accepted_pairs": int(len(cycle_pairs)),
             "peak_indices": peaks,
             "s1_indices": s1_peaks_np,
             "s2_indices": s2_peaks_np,
+            "unassigned_indices": unassigned_peaks,
+            "cycle_pairs": cycle_pairs,
             "peak_times_s": peaks / sample_rate,
             "s1_times_s": s1_peaks_np / sample_rate,
             "s2_times_s": s2_peaks_np / sample_rate,
@@ -564,22 +747,25 @@ def run_pcg_pipeline(
         },
         "classification": {
             "cycles": cycles,
+            "rejected_cycles": rejected_cycles,
             "rule_based": {
                 "normal_cycles": len(cycles) - len(flagged),
                 "flagged_cycles": len(flagged),
                 "flagged_details": flagged,
             },
-            "isolation_forest": {
-                "feature_keys": feat_keys,
-                "labels": labels,
-                "scores": scores,
-                **anomaly_summary,
+            "robust_outliers": {
+                "z_threshold": cfg.robust_z_thresh,
+                "findings": robust_outliers,
+                "outlier_cycle_indices": outlier_cycle_indices,
+                "n_outlier_cycles": len(outlier_cycle_indices),
+                "n_normal_cycles": len(cycles) - len(outlier_cycle_indices),
             },
             "per_cycle_stats": per_cycle_stats,
             "hrv_metrics": hrv_metrics,
         },
         "murmur": {
             "analysis_range_hz": [0.0, nyq],
+            "detection_ratio": cfg.murmur_detection_ratio,
             "systolic_murmur_cycles": sys_m,
             "diastolic_murmur_cycles": dia_m,
             "total_cycles": total,

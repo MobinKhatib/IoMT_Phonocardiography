@@ -16,8 +16,6 @@ A Python pipeline that converts a raw WAV phonocardiogram (PCG) recording into s
 8. [CLI usage](#8-cli-usage)
 9. [WebUI integration](#9-webui-integration)
 10. [Performance guidance](#10-performance-guidance)
-11. [Running the tests](#11-running-the-tests)
-12. [Medical disclaimer](#12-medical-disclaimer)
 
 ---
 

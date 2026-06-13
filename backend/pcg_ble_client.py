@@ -4,10 +4,18 @@ import time
 import numpy as np
 from bleak import BleakClient, BleakScanner
 from typing import Generator
+from analyze_pipeline import PCGConfig, run_pcg_pipeline
 
 class BLEConnectionError(Exception):
     """Raised when BLE connection fails or drops."""
     pass
+
+class PCGClientConfig:
+    sample_rate: int = 500
+    oversample_count: int = 8
+    batch_size: int = 6
+    patient_name: str = "Test_Patient"
+    analysis_time_seconds: int = 60
 
 class PCGClient:
     """
@@ -258,3 +266,6 @@ class PCGClient:
         except Exception as e:
             # bleak swallows callback exceptions silently; surface it.
             print(f"[notif] handler error: {e!r}")
+
+
+

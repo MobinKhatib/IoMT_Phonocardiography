@@ -1,0 +1,22 @@
+Altium Designer Pick and Place Locations
+C:\Users\mbnkh\Desktop\Polimi\Course\Semester 2\IoMT\Altium\PCB_Project_Stethoscope\Project Outputs for PCB_Project_Stethoscope\Pick Place\Pick Place for PCB3.txt
+
+========================================================================================================================
+File Design Information:
+
+Date:       21/06/26
+Time:       14:28
+Revision:   Not in VersionControl
+Variant:    No variations
+Units used: mil
+
+Designator Comment                          Layer    Footprint                  Center-X(mil) Center-Y(mil) Rotation Description                           
+U2         SEN-14262                        TopLayer SEN-14262                  4600.000      4160.000      270      "Audio sensor"                        
+U3         "USB-C Charger Module"           TopLayer ADAFRUIT-4410              2600.000      3710.000      180      "ADAFRUIT 4410 MICROLIPO USBC MODULE" 
+U1         "Arduino Nano ESP 32"            TopLayer PCBCOMPONENT_1_-_DUPLICATE 3377.500      3345.000      90       ""                                    
+R2         2.2k                             TopLayer RES                        3960.000      3655.000      90       Resistor                              
+R1         2.2k                             TopLayer RES                        3920.000      4060.000      0        Resistor                              
+J1         "JST-PH 2-pin Battery Connector" TopLayer JST-PH_2-PIN_CONNECTOR     2835.000      4340.000      270      "JST-PH 2-pin LiPo Battery Connector" 
+IC1        MDOB048064AV-WI                  TopLayer MDOB048064AV-WI            2810.000      2780.000      180      LED                                   
+C2         10u                              TopLayer CAP                        3930.000      3040.000      0        capacitor                             
+C1         100u                             TopLayer CAP                        2925.000      2690.000      270      capacitor                             

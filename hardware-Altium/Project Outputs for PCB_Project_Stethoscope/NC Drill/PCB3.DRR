@@ -1,0 +1,17 @@
+----------------------------------------------------------------------------------------------------------------------------------
+NCDrill File Report For: PCB3.PcbDoc   6/21/2026  2:28:50 PM
+----------------------------------------------------------------------------------------------------------------------------------
+
+Layer Pair : Top Layer to Bottom Layer
+ASCII RoundHoles File : PCB3-RoundHoles.TXT
+ASCII SquareHoles File : PCB3-SquareHoles.TXT
+
+Tool       Hole Size               Hole Tolerance               Hole Type       Hole Count   Plated         Tool Travel
+----------------------------------------------------------------------------------------------------------------------------------
+T1      0.9mm (35mil)                                             Round             2         PTH        2.54mm (0.10inch)
+T2      0.9mm (35mil)                                             Square            14        PTH        89.77mm (3.53inch)
+T3      1mm (39mil)                                               Round             30        PTH        106.93mm (4.21inch)
+----------------------------------------------------------------------------------------------------------------------------------
+Totals                                                                              46
+
+Total Processing Time (hh:mm:ss) : 00:00:00

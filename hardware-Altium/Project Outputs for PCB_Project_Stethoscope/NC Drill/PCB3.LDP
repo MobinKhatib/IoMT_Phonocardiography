@@ -1,0 +1,3 @@
+Layer Pairs Export File for PCB: C:\Users\mbnkh\Desktop\Polimi\Course\Semester 2\IoMT\Altium\PCB_Project_Stethoscope\PCB3.PcbDoc
+LayersSetName=Top_Bot_Thru_Holes|DrillFile=pcb3-roundholes.txt|DrillLayers=gtl,gbl
+LayersSetName=Top_Bot_Square_Holes|DrillFile=pcb3-squareholes.txt|DrillLayers=gtl,gbl
